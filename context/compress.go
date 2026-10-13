@@ -192,22 +192,20 @@ func LastReportedTotalTokens(events []Event) int {
 		if active[i].Kind != EventKindAssistant {
 			continue
 		}
+		if usage, ok := active[i].ProviderMeta[provider.UsageMetadataKey].(map[string]any); ok {
+			switch total := usage["total_tokens"].(type) {
+			case int:
+				if total > 0 {
+					return total
+				}
+			case float64:
+				if total > 0 && total <= math.MaxInt {
+					return int(total)
+				}
+			}
+		}
 		if active[i].TotalTokens > 0 {
 			return active[i].TotalTokens
-		}
-		usage, ok := active[i].ProviderMeta[provider.UsageMetadataKey].(map[string]any)
-		if !ok {
-			continue
-		}
-		switch total := usage["total_tokens"].(type) {
-		case int:
-			if total > 0 {
-				return total
-			}
-		case float64:
-			if total > 0 && total <= math.MaxInt {
-				return int(total)
-			}
 		}
 	}
 	return 0
