@@ -28,6 +28,14 @@ type ToolCall struct {
 	Arguments string `json:"arguments"`
 }
 
+type GoalState struct {
+	Definition string `json:"definition"`
+	Criteria   string `json:"criteria"`
+	Status     string `json:"status"`
+	Evidence   string `json:"evidence,omitempty"`
+	Blocker    string `json:"blocker,omitempty"`
+}
+
 type Event struct {
 	Kind             EventKind        `json:"kind"`
 	OccurredAt       string           `json:"occurred_at,omitempty"`
@@ -40,6 +48,7 @@ type Event struct {
 	ProviderMeta     map[string]any   `json:"provider_meta,omitempty"`
 	TotalTokens      int              `json:"total_tokens,omitempty"`
 	CompressionData  *CompressionData `json:"compression,omitempty"`
+	Goal             *GoalState       `json:"goal,omitempty"`
 }
 
 type RetainedFile struct {
@@ -84,6 +93,23 @@ type CompressionStatus struct {
 // FileReader loads a workspace-relative file during context compression so
 // callers can read retained files from a container, remote volume, or disk.
 type FileReader func(ctx stdctx.Context, relPath string) ([]byte, error)
+
+func CloneGoal(g *GoalState) *GoalState {
+	if g == nil {
+		return nil
+	}
+	c := *g
+	return &c
+}
+
+func GoalFromHistory(history []Event) *GoalState {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Goal != nil {
+			return CloneGoal(history[i].Goal)
+		}
+	}
+	return nil
+}
 
 func UserEvent(content any) Event {
 	return Event{Kind: EventKindUser, Content: CloneAny(content)}
@@ -194,6 +220,7 @@ func CloneEvents(events []Event) []Event {
 			ProviderMeta:     provider.CopyMapAny(ev.ProviderMeta),
 			TotalTokens:      ev.TotalTokens,
 			CompressionData:  CloneCompressionData(ev.CompressionData),
+			Goal:             CloneGoal(ev.Goal),
 		}
 		if ev.Model != nil {
 			model := *ev.Model

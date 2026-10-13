@@ -19,7 +19,7 @@ const (
 	TypeZen              = "zen"
 	TypeCline            = "cline"
 
-	DefaultOpenAICompatibleURL = "http://localhost:8787/v1/chat/completions"
+	DefaultOpenAICompatibleURL = "http://localhost:8787/chat/completions"
 	DefaultOpenRouterURL       = "https://openrouter.ai/api/v1/chat/completions"
 	DefaultResponsesURL        = "https://api.openai.com/v1/responses"
 	DefaultXAIURL              = "https://api.x.ai/v1/responses"

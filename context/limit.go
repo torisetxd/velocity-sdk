@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	DefaultModelTokenBudget = 12000
+	DefaultModelTokenBudget = 9500
 	MaxModelTokenBudget     = 16000
 )
 

@@ -20,6 +20,7 @@ const (
 
 type ModelRef = vcontext.ModelRef
 type ToolCall = vcontext.ToolCall
+type GoalState = vcontext.GoalState
 type Event = vcontext.Event
 type RetainedFile = vcontext.RetainedFile
 type CompressionData = vcontext.CompressionData
@@ -31,18 +32,20 @@ type CompressionRequestOptions = vcontext.CompressionRequestOptions
 type FileReader = vcontext.FileReader
 
 var (
-	UserEvent                        = vcontext.UserEvent
-	SystemEvent                      = vcontext.SystemEvent
-	InternalEvent                    = vcontext.InternalEvent
-	AssistantEvent                   = vcontext.AssistantEvent
-	ToolResultEvent                  = vcontext.ToolResultEvent
-	CompressionBoundaryEvent         = vcontext.CompressionBoundaryEvent
-	CompressionBoundaryEventWithData = vcontext.CompressionBoundaryEventWithData
+	UserEvent                         = vcontext.UserEvent
+	SystemEvent                       = vcontext.SystemEvent
+	InternalEvent                     = vcontext.InternalEvent
+	AssistantEvent                    = vcontext.AssistantEvent
+	ToolResultEvent                   = vcontext.ToolResultEvent
+	CompressionBoundaryEvent          = vcontext.CompressionBoundaryEvent
+	CompressionBoundaryEventWithData  = vcontext.CompressionBoundaryEventWithData
 	CompressionBoundaryEventWithFiles = vcontext.CompressionBoundaryEventWithFiles
-	CloneSession                     = vcontext.CloneSession
-	CloneEvents                      = vcontext.CloneEvents
-	CloneToolCalls                   = vcontext.CloneToolCalls
-	CloneAny                         = vcontext.CloneAny
+	CloneSession                      = vcontext.CloneSession
+	CloneEvents                       = vcontext.CloneEvents
+	CloneToolCalls                    = vcontext.CloneToolCalls
+	CloneAny                          = vcontext.CloneAny
+	CloneGoal                         = vcontext.CloneGoal
+	GoalFromHistory                   = vcontext.GoalFromHistory
 )
 
 type RetryStatus struct {
@@ -102,25 +105,30 @@ func (f FuncToolExecutor) Execute(ctx context.Context, call ToolCall, onOutput f
 }
 
 type Runner struct {
-	Provider              provider.Provider
-	Tools                 ToolExecutor
-	Model                 ModelRef
-	ModelExtra            map[string]any
-	Root                  string
-	FileReader            FileReader
-	Observer              Observer
-	ContinuationPrompt    string
-	PromptCacheEnabled    bool
-	PipelinedTools        bool
-	Steer                 func() []string
-	InternalMessages      func() []string
-	AutoCompress          AutoCompress
-	AutoCompressFn        func() AutoCompress
-	Compress              func(context.Context, []Event, []provider.ToolDef, string) (CompressionResult, error)
-	MaxRetries            int
-	MaxEmptyRetries       int
-	MaxServerErrorRetries int
-	MaxToolRounds         int
+	Provider               provider.Provider
+	Tools                  ToolExecutor
+	Model                  ModelRef
+	ModelExtra             map[string]any
+	Root                   string
+	FileReader             FileReader
+	Observer               Observer
+	ContinuationPrompt     string
+	ContinuationPromptFn   func() string
+	PromptCacheEnabled     bool
+	PipelinedTools         bool
+	Steer                  func() []string
+	InternalMessages       func() []string
+	InternalContext        func(lastInternal string) string
+	TransformUserPrompt    func(ctx context.Context, prompt string) any
+	PrepareMessages        func(ctx context.Context, messages []provider.ChatMessage) []provider.ChatMessage
+	DecorateAssistantEvent func(ev *Event)
+	AutoCompress           AutoCompress
+	AutoCompressFn         func() AutoCompress
+	Compress               func(context.Context, []Event, []provider.ToolDef, string) (CompressionResult, error)
+	MaxRetries             int
+	MaxEmptyRetries        int
+	MaxServerErrorRetries  int
+	MaxToolRounds          int
 }
 
 type TurnResult struct {

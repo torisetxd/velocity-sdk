@@ -19,8 +19,7 @@ import (
 
 const (
 	defaultMaxRetries      = 15
-	defaultMaxEmptyRetries = 2
-	defaultMaxToolRounds   = 64
+	defaultMaxEmptyRetries = 15
 )
 
 func (r Runner) effectiveMaxRetries() int {
@@ -47,13 +46,6 @@ func (r Runner) effectiveMaxServerErrorRetries() int {
 	return defaultMaxRetries
 }
 
-func (r Runner) effectiveMaxToolRounds() int {
-	if r.MaxToolRounds > 0 {
-		return r.MaxToolRounds
-	}
-	return defaultMaxToolRounds
-}
-
 func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runErr error) {
 	if r.Provider == nil {
 		return TurnResult{}, fmt.Errorf("provider is required")
@@ -75,6 +67,8 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 	toolRounds := 0
 	forceFinal := false
 
+	vcontext.FlushInternalContext(&history, &renderedHistory, caps, r.InternalContext)
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return TurnResult{
@@ -94,9 +88,14 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		}
 		r.maybeAutoCompress(ctx, sess.ID, definitions, &history, &renderedHistory, &warnings, &lastReportedTotalTokens, &lastTotalTokens)
 
+		messages := renderedHistory
+		if r.PrepareMessages != nil {
+			messages = r.PrepareMessages(ctx, messages)
+		}
+
 		req := provider.ChatRequest{
 			Model:          r.Model.Model,
-			Messages:       renderedHistory,
+			Messages:       messages,
 			Tools:          definitions,
 			ToolChoice:     "auto",
 			Stream:         true,
@@ -108,7 +107,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		}
 
 		var toolResults []any
-		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, err := r.runSingleTurn(ctx, req, &toolResults)
+		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, err := r.RunSingleTurn(ctx, req, &toolResults)
 		if err != nil {
 			return TurnResult{
 				History:          history,
@@ -157,17 +156,6 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 
 				r.emitRetry(RetryStatus{Attempt: attempt, Max: maxEmptyRetries, Done: false, Reason: "empty response"})
 
-				emptyAssistant := AssistantEvent("", reasoningText, reasoningDetails, nil, 0)
-				retryMessages := append(append([]provider.ChatMessage(nil), req.Messages...),
-					vcontext.EventToProviderMessage(emptyAssistant, caps),
-					provider.ChatMessage{
-						Role:    "system",
-						Content: "The previous turn ended without a visible answer. Continue now and provide a direct final response to the user's request.",
-					},
-				)
-				retryReq := req
-				retryReq.Messages = retryMessages
-
 				backoff := time.Duration(100+rand.Intn(200)) * time.Millisecond
 				timer := time.NewTimer(backoff)
 				select {
@@ -188,7 +176,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 
 				toolResults = nil
 				var emptyRetryErr error
-				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, emptyRetryErr = r.runSingleTurn(ctx, retryReq, &toolResults)
+				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, emptyRetryErr = r.RunSingleTurn(ctx, req, &toolResults)
 				if emptyRetryErr != nil {
 					clearEmptyRetry()
 					return TurnResult{
@@ -222,7 +210,15 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 				}
 				if attempt >= maxEmptyRetries {
 					clearEmptyRetry()
-					break
+					return TurnResult{
+						History:          history,
+						Reasoning:        allReasoning,
+						ReasoningDetails: allReasoningDetails,
+						Reply:            allContent,
+						Trace:            trace,
+						Warnings:         warnings,
+						TotalTokens:      lastTotalTokens,
+					}, fmt.Errorf("model returned empty response after %d retries", maxEmptyRetries)
 				}
 			}
 		}
@@ -236,12 +232,21 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		model := r.Model
 		assistantEvent.Model = &model
 		assistantEvent.ProviderMeta = provider.CopyMapAny(providerMeta)
+		if r.DecorateAssistantEvent != nil {
+			r.DecorateAssistantEvent(&assistantEvent)
+		}
 		history = append(history, assistantEvent)
 		renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(assistantEvent, caps))
 
-		if len(toolCalls) == 0 && r.ContinuationPrompt != "" {
-			r.appendUserMessage(&history, &renderedHistory, r.ContinuationPrompt, caps)
-			r.drainQueuedPrompts(&history, &renderedHistory, caps)
+		continuation := r.ContinuationPrompt
+		if r.ContinuationPromptFn != nil {
+			if dyn := r.ContinuationPromptFn(); dyn != "" {
+				continuation = dyn
+			}
+		}
+		if len(toolCalls) == 0 && continuation != "" {
+			r.appendUserMessage(ctx, &history, &renderedHistory, continuation, caps)
+			r.drainQueuedPrompts(ctx, &history, &renderedHistory, caps)
 			continue
 		}
 
@@ -268,7 +273,9 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 			renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(toolEvent, caps))
 		}
 
-		if r.drainQueuedPrompts(&history, &renderedHistory, caps) {
+		vcontext.FlushInternalContext(&history, &renderedHistory, caps, r.InternalContext)
+
+		if r.drainQueuedPrompts(ctx, &history, &renderedHistory, caps) {
 			continue
 		}
 
@@ -277,7 +284,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 				History:          history,
 				Reasoning:        allReasoning,
 				ReasoningDetails: allReasoningDetails,
-				Reply:            allContent,
+				Reply:            assistantText,
 				Trace:            trace,
 				Warnings:         warnings,
 				TotalTokens:      lastTotalTokens,
@@ -285,7 +292,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		}
 
 		toolRounds++
-		if toolRounds >= r.effectiveMaxToolRounds() {
+		if r.MaxToolRounds > 0 && toolRounds >= r.MaxToolRounds {
 			forceFinal = true
 			renderedHistory = append(renderedHistory, provider.ChatMessage{
 				Role:    "system",
@@ -340,11 +347,13 @@ func (r Runner) maybeAutoCompress(ctx context.Context, sessionID string, tools [
 		next = append(next, CloneEvents(tail)...)
 	}
 	*history = next
-	rendered, w := vcontext.RenderHistory(*history, vcontext.ProviderCapabilities(r.Provider))
+	caps := vcontext.ProviderCapabilities(r.Provider)
+	rendered, w := vcontext.RenderHistory(*history, caps)
 	*renderedHistory = rendered
 	if warnings != nil && len(w) > 0 {
 		*warnings = append(*warnings, w...)
 	}
+	vcontext.FlushInternalContext(history, renderedHistory, caps, r.InternalContext)
 	if lastTotalTokens != nil && result.CompressedTokens > 0 {
 		*lastTotalTokens = result.CompressedTokens
 	}
@@ -362,9 +371,9 @@ func (r Runner) maybeAutoCompress(ctx context.Context, sessionID string, tools [
 	})
 }
 
-func (r Runner) drainQueuedPrompts(history *[]Event, renderedHistory *[]provider.ChatMessage, caps provider.Capabilities) bool {
+func (r Runner) drainQueuedPrompts(ctx context.Context, history *[]Event, renderedHistory *[]provider.ChatMessage, caps provider.Capabilities) bool {
 	injected := false
-	if r.InternalMessages != nil {
+	if ctx.Err() == nil && r.InternalMessages != nil {
 		for _, content := range r.InternalMessages() {
 			ev := InternalEvent(content)
 			*history = append(*history, ev)
@@ -380,13 +389,17 @@ func (r Runner) drainQueuedPrompts(history *[]Event, renderedHistory *[]provider
 		return injected
 	}
 	for _, prompt := range prompts {
-		r.appendUserMessage(history, renderedHistory, prompt, caps)
+		r.appendUserMessage(ctx, history, renderedHistory, prompt, caps)
 	}
 	return true
 }
 
-func (r Runner) appendUserMessage(history *[]Event, renderedHistory *[]provider.ChatMessage, msg string, caps provider.Capabilities) {
-	ev := UserEvent(msg)
+func (r Runner) appendUserMessage(ctx context.Context, history *[]Event, renderedHistory *[]provider.ChatMessage, msg string, caps provider.Capabilities) {
+	var content any = msg
+	if r.TransformUserPrompt != nil {
+		content = r.TransformUserPrompt(ctx, msg)
+	}
+	ev := UserEvent(content)
 	*history = append(*history, ev)
 	*renderedHistory = append(*renderedHistory, vcontext.EventToProviderMessage(ev, caps))
 	if r.Observer.OnUserMessage != nil {
@@ -400,10 +413,11 @@ func (r Runner) executeOneTool(ctx context.Context, tc ToolCall) any {
 		return "turn cancelled"
 	}
 	if r.Tools == nil {
-		msg := "error: no tool executor configured"
-		r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Text: msg, Done: true})
+		msg := "tool error: no tool executor configured"
+		r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Text: msg + "\n", Done: true})
 		return msg
 	}
+
 	var doneEmitted bool
 	result := r.Tools.Execute(ctx, tc, func(output ToolOutput) {
 		output.ToolCallID = tc.ID
@@ -427,7 +441,7 @@ type singleTurnResult struct {
 	totalTokens      int
 }
 
-func (r Runner) runSingleTurn(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (content string, reasoning string, reasoningDetails []map[string]any, providerMeta map[string]any, toolCalls []ToolCall, totalTokens int, err error) {
+func (r Runner) RunSingleTurn(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (content string, reasoning string, reasoningDetails []map[string]any, providerMeta map[string]any, toolCalls []ToolCall, totalTokens int, err error) {
 	retryState := turnRetryState{}
 	defer func() {
 		r.finishTurnRetry(retryState)
@@ -456,7 +470,9 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 	retrySafe := true
 
 	assistantText := ""
+	seenContentText := false
 	reasoningText := ""
+	seenReasoningText := false
 	details := []map[string]any{}
 	meta := map[string]any{}
 	toolCalls := []ToolCall{}
@@ -533,14 +549,28 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 
 		if ev.Reasoning != "" {
 			retrySafe = false
-			reasoningText += ev.Reasoning
-			r.emitAssistantDelta(Delta{Reasoning: ev.Reasoning})
+			reasoningDelta := ev.Reasoning
+			if !seenReasoningText {
+				reasoningDelta = strings.TrimPrefix(reasoningDelta, " ")
+				seenReasoningText = true
+			}
+			if reasoningDelta != "" {
+				reasoningText += reasoningDelta
+				r.emitAssistantDelta(Delta{Reasoning: reasoningDelta})
+			}
 		}
 
 		if ev.Content != "" {
 			retrySafe = false
-			assistantText += ev.Content
-			r.emitAssistantDelta(Delta{Content: ev.Content})
+			contentDelta := ev.Content
+			if !seenContentText {
+				contentDelta = strings.TrimPrefix(contentDelta, " ")
+				seenContentText = true
+			}
+			if contentDelta != "" {
+				assistantText += contentDelta
+				r.emitAssistantDelta(Delta{Content: contentDelta})
+			}
 		}
 
 		if len(ev.ReasoningDetails) > 0 {
@@ -624,7 +654,7 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 			} else {
 				fmt.Sscanf(key, "idx_%d", &idx)
 			}
-			if strings.TrimSpace(tc.ID) == "" {
+			if strings.TrimSpace(tc.ID) == "" && r.Tools != nil {
 				tc.ID = uuid.New().String()
 			}
 			sorted = append(sorted, keyedTool{index: idx, tc: *tc})

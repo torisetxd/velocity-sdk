@@ -152,6 +152,7 @@ func streamChatCompletions(
 
 func (s *openAIStream) readLoop() {
 	defer close(s.readerDone)
+	defer close(s.lineCh)
 
 	reader := bufio.NewReaderSize(s.resp.Body, 64*1024)
 	for {

@@ -31,10 +31,11 @@ type CompressionResult struct {
 }
 
 type CompressionRequestOptions struct {
-	PromptCacheKey string
-	Tools          []provider.ToolDef
-	Root           string
-	FileReader     FileReader
+	PromptCacheKey   string
+	Tools            []provider.ToolDef
+	Root             string
+	FileReader       FileReader
+	SummaryTransform func(events []Event, summary string) string
 }
 
 func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRef, modelExtra map[string]any, history []Event, opts CompressionRequestOptions) (CompressionResult, error) {
@@ -100,6 +101,9 @@ func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRe
 	cleanedSummary, rawRetained := ExtractFilesToRetainBlock(rawSummary)
 	retainedFiles := LoadRetainedFiles(ctx, opts.Root, rawRetained, opts.FileReader)
 	compressedSummary := cleanedSummary
+	if opts.SummaryTransform != nil {
+		compressedSummary = opts.SummaryTransform(events, compressedSummary)
+	}
 
 	transcript := userAssistantTranscript(events)
 	originalTokens := EstimateTokens(ActiveHistory(events))
@@ -330,7 +334,7 @@ func collapseImageDataURLs(s string) int {
 	return len(collapsed)
 }
 
-func nonSystemEvents(events []Event) []Event {
+func NonSystemEvents(events []Event) []Event {
 	out := make([]Event, 0, len(events))
 	for _, ev := range events {
 		if ev.Kind != EventKindSystem && ev.Kind != EventKindInternal && ev.Kind != EventKindCompressionBoundary {
@@ -361,7 +365,7 @@ func ActiveHistory(events []Event) []Event {
 		case i < boundary && ev.Kind != EventKindSystem:
 			continue
 		case i == boundary:
-			block := boundaryAsBlock(ev)
+			block := BoundaryAsBlock(ev)
 			if block != "" {
 				out = append(out, InternalEvent(block))
 			}
@@ -372,7 +376,7 @@ func ActiveHistory(events []Event) []Event {
 	return out
 }
 
-func boundaryAsBlock(ev Event) string {
+func BoundaryAsBlock(ev Event) string {
 	summary := transcriptContent(ev.Content)
 	var b strings.Builder
 	b.WriteString(compressedContextOpen)
@@ -437,7 +441,7 @@ func IsCompressedOnlyHistory(events []Event) bool {
 
 func FormatEventsForCompression(events []Event) string {
 	var b strings.Builder
-	for i, ev := range nonSystemEvents(events) {
+	for i, ev := range NonSystemEvents(events) {
 		if i > 0 {
 			b.WriteString("\n\n---\n\n")
 		}
