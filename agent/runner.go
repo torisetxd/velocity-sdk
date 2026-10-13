@@ -1,0 +1,707 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	vcontext "velocitylabs.cc/sdk/context"
+	"velocitylabs.cc/sdk/internal/debugtrace"
+	"velocitylabs.cc/sdk/provider"
+)
+
+const (
+	defaultMaxRetries      = 15
+	defaultMaxEmptyRetries = 2
+	defaultMaxToolRounds   = 64
+)
+
+func (r Runner) effectiveMaxRetries() int {
+	if r.MaxRetries > 0 {
+		return r.MaxRetries
+	}
+	return defaultMaxRetries
+}
+
+func (r Runner) effectiveMaxEmptyRetries() int {
+	if r.MaxEmptyRetries > 0 {
+		return r.MaxEmptyRetries
+	}
+	if r.MaxEmptyRetries < 0 {
+		return 0
+	}
+	return defaultMaxEmptyRetries
+}
+
+func (r Runner) effectiveMaxServerErrorRetries() int {
+	if r.MaxServerErrorRetries > 0 {
+		return r.MaxServerErrorRetries
+	}
+	return defaultMaxRetries
+}
+
+func (r Runner) effectiveMaxToolRounds() int {
+	if r.MaxToolRounds > 0 {
+		return r.MaxToolRounds
+	}
+	return defaultMaxToolRounds
+}
+
+func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runErr error) {
+	if r.Provider == nil {
+		return TurnResult{}, fmt.Errorf("provider is required")
+	}
+	if strings.TrimSpace(r.Model.Model) == "" {
+		return TurnResult{}, fmt.Errorf("model is required")
+	}
+
+	caps := vcontext.ProviderCapabilities(r.Provider)
+	history := CloneEvents(sess.History)
+	renderedHistory, warnings := vcontext.RenderHistory(history, caps)
+	trace := []string{}
+	allReasoning := ""
+	var allReasoningDetails []map[string]any
+	allContent := ""
+	lastTotalTokens := sess.LastTotalTokens
+	lastReportedTotalTokens := vcontext.LastReportedTotalTokens(history)
+	prevTotalTokens := lastTotalTokens
+	toolRounds := 0
+	forceFinal := false
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return TurnResult{
+				History:          history,
+				Reasoning:        allReasoning,
+				ReasoningDetails: allReasoningDetails,
+				Reply:            allContent,
+				Trace:            trace,
+				Warnings:         warnings,
+				TotalTokens:      lastTotalTokens,
+			}, err
+		}
+
+		var definitions []provider.ToolDef
+		if !forceFinal && r.Tools != nil {
+			definitions = r.Tools.Definitions(ctx)
+		}
+		r.maybeAutoCompress(ctx, sess.ID, definitions, &history, &renderedHistory, &warnings, &lastReportedTotalTokens, &lastTotalTokens)
+
+		req := provider.ChatRequest{
+			Model:          r.Model.Model,
+			Messages:       renderedHistory,
+			Tools:          definitions,
+			ToolChoice:     "auto",
+			Stream:         true,
+			ExtraBody:      provider.CopyMapAny(r.ModelExtra),
+			PromptCacheKey: vcontext.PromptCacheKeyForSession(r.Provider, r.PromptCacheEnabled, sess.ID),
+		}
+		if len(definitions) == 0 {
+			req.ToolChoice = ""
+		}
+
+		var toolResults []any
+		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, err := r.runSingleTurn(ctx, req, &toolResults)
+		if err != nil {
+			return TurnResult{
+				History:          history,
+				Reasoning:        allReasoning,
+				ReasoningDetails: allReasoningDetails,
+				Reply:            allContent,
+				Trace:            trace,
+				Warnings:         warnings,
+				TotalTokens:      lastTotalTokens,
+			}, err
+		}
+
+		if reasoningText != "" {
+			allReasoning += reasoningText
+		}
+		if len(reasoningDetails) > 0 {
+			provider.AppendReasoningDetails(&allReasoningDetails, reasoningDetails)
+		}
+		if assistantText != "" {
+			allContent += assistantText
+		}
+		lastReportedTotalTokens = tokens
+		if tokens > 0 {
+			prevTotalTokens = lastTotalTokens
+			lastTotalTokens = tokens
+		}
+
+		if strings.TrimSpace(assistantText) == "" && len(toolCalls) == 0 {
+			maxEmptyRetries := r.effectiveMaxEmptyRetries()
+			for attempt := 1; attempt <= maxEmptyRetries; attempt++ {
+				clearEmptyRetry := func() {
+					r.emitRetry(RetryStatus{Attempt: attempt, Max: maxEmptyRetries, Done: true, Reason: "empty response"})
+				}
+				if err := ctx.Err(); err != nil {
+					clearEmptyRetry()
+					return TurnResult{
+						History:          history,
+						Reasoning:        allReasoning,
+						ReasoningDetails: allReasoningDetails,
+						Reply:            allContent,
+						Trace:            trace,
+						Warnings:         warnings,
+						TotalTokens:      lastTotalTokens,
+					}, err
+				}
+
+				r.emitRetry(RetryStatus{Attempt: attempt, Max: maxEmptyRetries, Done: false, Reason: "empty response"})
+
+				emptyAssistant := AssistantEvent("", reasoningText, reasoningDetails, nil, 0)
+				retryMessages := append(append([]provider.ChatMessage(nil), req.Messages...),
+					vcontext.EventToProviderMessage(emptyAssistant, caps),
+					provider.ChatMessage{
+						Role:    "system",
+						Content: "The previous turn ended without a visible answer. Continue now and provide a direct final response to the user's request.",
+					},
+				)
+				retryReq := req
+				retryReq.Messages = retryMessages
+
+				backoff := time.Duration(100+rand.Intn(200)) * time.Millisecond
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					clearEmptyRetry()
+					return TurnResult{
+						History:          history,
+						Reasoning:        allReasoning,
+						ReasoningDetails: allReasoningDetails,
+						Reply:            allContent,
+						Trace:            trace,
+						Warnings:         warnings,
+						TotalTokens:      lastTotalTokens,
+					}, ctx.Err()
+				case <-timer.C:
+				}
+
+				toolResults = nil
+				var emptyRetryErr error
+				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, emptyRetryErr = r.runSingleTurn(ctx, retryReq, &toolResults)
+				if emptyRetryErr != nil {
+					clearEmptyRetry()
+					return TurnResult{
+						History:          history,
+						Reasoning:        allReasoning,
+						ReasoningDetails: allReasoningDetails,
+						Reply:            allContent,
+						Trace:            trace,
+						Warnings:         warnings,
+						TotalTokens:      lastTotalTokens,
+					}, emptyRetryErr
+				}
+
+				if reasoningText != "" {
+					allReasoning += reasoningText
+				}
+				if len(reasoningDetails) > 0 {
+					provider.AppendReasoningDetails(&allReasoningDetails, reasoningDetails)
+				}
+				if assistantText != "" {
+					allContent += assistantText
+				}
+				lastReportedTotalTokens = tokens
+				if tokens > 0 {
+					prevTotalTokens = lastTotalTokens
+					lastTotalTokens = tokens
+				}
+				if strings.TrimSpace(assistantText) != "" || len(toolCalls) > 0 {
+					clearEmptyRetry()
+					break
+				}
+				if attempt >= maxEmptyRetries {
+					clearEmptyRetry()
+					break
+				}
+			}
+		}
+
+		turnTokens := tokens - prevTotalTokens
+		if turnTokens < 0 {
+			turnTokens = tokens
+		}
+		assistantEvent := AssistantEvent(assistantText, reasoningText, reasoningDetails, toolCalls, turnTokens)
+		assistantEvent.OccurredAt = time.Now().UTC().Format(time.RFC3339Nano)
+		model := r.Model
+		assistantEvent.Model = &model
+		assistantEvent.ProviderMeta = provider.CopyMapAny(providerMeta)
+		history = append(history, assistantEvent)
+		renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(assistantEvent, caps))
+
+		if len(toolCalls) == 0 && r.ContinuationPrompt != "" {
+			r.appendUserMessage(&history, &renderedHistory, r.ContinuationPrompt, caps)
+			r.drainQueuedPrompts(&history, &renderedHistory, caps)
+			continue
+		}
+
+		if len(toolCalls) > 0 && forceFinal {
+			limitMessage := "I reached the task's tool-call safety limit. The work completed so far remains in the workspace; please ask me to continue."
+			r.emitAssistantDelta(Delta{Content: limitMessage})
+			allContent += limitMessage
+			return TurnResult{
+				History:          history,
+				Reasoning:        allReasoning,
+				ReasoningDetails: allReasoningDetails,
+				Reply:            allContent,
+				Trace:            trace,
+				Warnings:         warnings,
+				TotalTokens:      lastTotalTokens,
+			}, nil
+		}
+
+		for i, tc := range toolCalls {
+			trace = append(trace, fmt.Sprintf("- %s(%s)", tc.Name, tc.Arguments))
+			result := toolResults[i]
+			toolEvent := ToolResultEvent(tc.ID, result)
+			history = append(history, toolEvent)
+			renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(toolEvent, caps))
+		}
+
+		if r.drainQueuedPrompts(&history, &renderedHistory, caps) {
+			continue
+		}
+
+		if len(toolCalls) == 0 {
+			return TurnResult{
+				History:          history,
+				Reasoning:        allReasoning,
+				ReasoningDetails: allReasoningDetails,
+				Reply:            allContent,
+				Trace:            trace,
+				Warnings:         warnings,
+				TotalTokens:      lastTotalTokens,
+			}, nil
+		}
+
+		toolRounds++
+		if toolRounds >= r.effectiveMaxToolRounds() {
+			forceFinal = true
+			renderedHistory = append(renderedHistory, provider.ChatMessage{
+				Role:    "system",
+				Content: "You have reached the tool-call safety limit for this response. Do not call more tools. Summarize the completed work, remaining work, and relevant files for the user.",
+			})
+		}
+	}
+}
+
+func (r Runner) maybeAutoCompress(ctx context.Context, sessionID string, tools []provider.ToolDef, history *[]Event, renderedHistory *[]provider.ChatMessage, warnings *[]string, reportedTotalTokens *int, lastTotalTokens *int) {
+	if history == nil {
+		return
+	}
+	cfg := r.AutoCompress
+	if r.AutoCompressFn != nil {
+		cfg = r.AutoCompressFn()
+	}
+	reported := 0
+	if reportedTotalTokens != nil {
+		reported = *reportedTotalTokens
+	}
+	ok, reason := vcontext.ShouldAutoCompressWithTokens(cfg, *history, reported)
+	if !ok {
+		return
+	}
+	head, tail, splitOK := vcontext.SplitUnansweredTail(*history)
+	if !splitOK {
+		return
+	}
+
+	r.emitCompression(CompressionStatus{Reason: reason})
+
+	var result CompressionResult
+	var err error
+	if r.Compress != nil {
+		result, err = r.Compress(ctx, head, tools, r.Root)
+	} else {
+		result, err = vcontext.CompressConversation(ctx, r.Provider, r.Model, r.ModelExtra, head, CompressionRequestOptions{
+			PromptCacheKey: vcontext.PromptCacheKeyForSession(r.Provider, r.PromptCacheEnabled, sessionID),
+			Tools:          tools,
+			Root:           r.Root,
+			FileReader:     r.FileReader,
+		})
+	}
+	if err != nil {
+		r.emitCompression(CompressionStatus{Done: true, Reason: reason, Err: err})
+		return
+	}
+
+	next := result.History
+	if len(tail) > 0 {
+		next = append(next, CloneEvents(tail)...)
+	}
+	*history = next
+	rendered, w := vcontext.RenderHistory(*history, vcontext.ProviderCapabilities(r.Provider))
+	*renderedHistory = rendered
+	if warnings != nil && len(w) > 0 {
+		*warnings = append(*warnings, w...)
+	}
+	if lastTotalTokens != nil && result.CompressedTokens > 0 {
+		*lastTotalTokens = result.CompressedTokens
+	}
+	if reportedTotalTokens != nil {
+		*reportedTotalTokens = result.CompressedTokens
+	}
+	r.emitCompression(CompressionStatus{
+		Done:             true,
+		Reason:           reason,
+		Summary:          result.Summary,
+		RetainedFiles:    result.RetainedFiles,
+		History:          CloneEvents(*history),
+		OriginalTokens:   result.OriginalTokens,
+		CompressedTokens: result.CompressedTokens,
+	})
+}
+
+func (r Runner) drainQueuedPrompts(history *[]Event, renderedHistory *[]provider.ChatMessage, caps provider.Capabilities) bool {
+	injected := false
+	if r.InternalMessages != nil {
+		for _, content := range r.InternalMessages() {
+			ev := InternalEvent(content)
+			*history = append(*history, ev)
+			*renderedHistory = append(*renderedHistory, vcontext.EventToProviderMessage(ev, caps))
+			injected = true
+		}
+	}
+	if r.Steer == nil {
+		return injected
+	}
+	prompts := r.Steer()
+	if len(prompts) == 0 {
+		return injected
+	}
+	for _, prompt := range prompts {
+		r.appendUserMessage(history, renderedHistory, prompt, caps)
+	}
+	return true
+}
+
+func (r Runner) appendUserMessage(history *[]Event, renderedHistory *[]provider.ChatMessage, msg string, caps provider.Capabilities) {
+	ev := UserEvent(msg)
+	*history = append(*history, ev)
+	*renderedHistory = append(*renderedHistory, vcontext.EventToProviderMessage(ev, caps))
+	if r.Observer.OnUserMessage != nil {
+		r.Observer.OnUserMessage(msg)
+	}
+}
+
+func (r Runner) executeOneTool(ctx context.Context, tc ToolCall) any {
+	if err := ctx.Err(); err != nil {
+		r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Text: "turn cancelled\n", Done: true})
+		return "turn cancelled"
+	}
+	if r.Tools == nil {
+		msg := "error: no tool executor configured"
+		r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Text: msg, Done: true})
+		return msg
+	}
+	var doneEmitted bool
+	result := r.Tools.Execute(ctx, tc, func(output ToolOutput) {
+		output.ToolCallID = tc.ID
+		if output.Done {
+			doneEmitted = true
+		}
+		r.emitToolOutput(output)
+	})
+	if !doneEmitted {
+		r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Done: true})
+	}
+	return result
+}
+
+type singleTurnResult struct {
+	content          string
+	reasoning        string
+	reasoningDetails []map[string]any
+	providerMeta     map[string]any
+	toolCalls        []ToolCall
+	totalTokens      int
+}
+
+func (r Runner) runSingleTurn(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (content string, reasoning string, reasoningDetails []map[string]any, providerMeta map[string]any, toolCalls []ToolCall, totalTokens int, err error) {
+	retryState := turnRetryState{}
+	defer func() {
+		r.finishTurnRetry(retryState)
+	}()
+	for {
+		result, retrySafe, attemptErr := r.runSingleTurnAttempt(ctx, req, earlyResults)
+		if attemptErr == nil {
+			return result.content, result.reasoning, result.reasoningDetails, result.providerMeta, result.toolCalls, result.totalTokens, nil
+		}
+		if !retrySafe {
+			return "", "", nil, nil, nil, 0, attemptErr
+		}
+		retry, retryErr := r.retryTurnAfter(ctx, attemptErr, &retryState)
+		if !retry {
+			return "", "", nil, nil, nil, 0, retryErr
+		}
+	}
+}
+
+func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (singleTurnResult, bool, error) {
+	stream, err := r.Provider.StreamChat(ctx, req)
+	if err != nil {
+		return singleTurnResult{}, true, err
+	}
+	defer stream.Close()
+	retrySafe := true
+
+	assistantText := ""
+	reasoningText := ""
+	details := []map[string]any{}
+	meta := map[string]any{}
+	toolCalls := []ToolCall{}
+	toolCallBuilders := map[string]*ToolCall{}
+	indexLastID := map[int]string{}
+	toolIDToIndex := map[string]int{}
+	lastTotalTokens := 0
+	var lastSeenID string
+
+	type execItem struct {
+		idx int
+		tc  ToolCall
+	}
+	var execMu sync.Mutex
+	execResults := map[int]any{}
+	execStarted := map[int]bool{}
+	execCh := make(chan execItem, 16)
+	streamDone := make(chan struct{})
+	execClosed := false
+
+	go func() {
+		for item := range execCh {
+			r.emitToolCall(item.tc)
+			result := r.executeOneTool(ctx, item.tc)
+			execMu.Lock()
+			execResults[item.idx] = result
+			execMu.Unlock()
+		}
+		close(streamDone)
+	}()
+	finishExec := func() {
+		if execClosed {
+			return
+		}
+		execClosed = true
+		close(execCh)
+		<-streamDone
+	}
+	defer finishExec()
+
+	tryExec := func(idx int, tc ToolCall) {
+		if strings.TrimSpace(tc.ID) == "" {
+			tc.ID = uuid.New().String()
+		}
+		execMu.Lock()
+		if execStarted[idx] {
+			execMu.Unlock()
+			return
+		}
+		execStarted[idx] = true
+		execMu.Unlock()
+		execCh <- execItem{idx: idx, tc: tc}
+	}
+
+	lastSeenDeltaIndex := -1
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return singleTurnResult{}, retrySafe, err
+		}
+
+		ev, recvErr := stream.Recv()
+		if recvErr != nil {
+			if errors.Is(recvErr, io.EOF) {
+				break
+			}
+			return singleTurnResult{}, retrySafe, recvErr
+		}
+
+		if ev.TotalTokens > 0 {
+			lastTotalTokens = ev.TotalTokens
+			r.emitAssistantDelta(Delta{TotalTokens: ev.TotalTokens})
+		}
+
+		if ev.Reasoning != "" {
+			retrySafe = false
+			reasoningText += ev.Reasoning
+			r.emitAssistantDelta(Delta{Reasoning: ev.Reasoning})
+		}
+
+		if ev.Content != "" {
+			retrySafe = false
+			assistantText += ev.Content
+			r.emitAssistantDelta(Delta{Content: ev.Content})
+		}
+
+		if len(ev.ReasoningDetails) > 0 {
+			provider.AppendReasoningDetails(&details, ev.ReasoningDetails)
+			r.emitAssistantDelta(Delta{ReasoningDetails: provider.CopyReasoningDetails(ev.ReasoningDetails)})
+		}
+		if len(ev.ProviderMeta) > 0 {
+			meta = provider.MergeMaps(meta, ev.ProviderMeta)
+		}
+		if ev.Usage != nil {
+			meta = provider.MergeMaps(meta, provider.TokenUsageMetadata(ev.Usage))
+		}
+
+		for _, d := range ev.ToolCallDeltas {
+			retrySafe = false
+			r.emitToolCallDelta(d)
+			debugtrace.Log("runner.tool_delta", map[string]any{
+				"index": d.Index,
+				"id":    d.ID,
+				"name":  d.FunctionName,
+			})
+
+			if r.PipelinedTools && d.Index > lastSeenDeltaIndex && lastSeenDeltaIndex >= 0 {
+				key := fmt.Sprintf("idx_%d", lastSeenDeltaIndex)
+				if foundID, ok := indexLastID[lastSeenDeltaIndex]; ok && toolCallBuilders[foundID] != nil {
+					key = foundID
+				}
+				if tc, ok2 := toolCallBuilders[key]; ok2 && tc.Name != "" {
+					tryExec(lastSeenDeltaIndex, *tc)
+				}
+			}
+			if d.Index > lastSeenDeltaIndex {
+				lastSeenDeltaIndex = d.Index
+			}
+
+			key := fmt.Sprintf("idx_%d", d.Index)
+			if d.ID != "" {
+				if existingID, ok := indexLastID[d.Index]; ok && existingID != d.ID && d.FunctionName == "" {
+					key = existingID
+				} else {
+					key = d.ID
+					indexLastID[d.Index] = d.ID
+					toolIDToIndex[d.ID] = d.Index
+					lastSeenID = d.ID
+				}
+			} else if lastID, ok := indexLastID[d.Index]; ok {
+				key = lastID
+				lastSeenID = lastID
+			} else if lastSeenID != "" {
+				key = lastSeenID
+			}
+
+			tc, ok := toolCallBuilders[key]
+			if !ok {
+				tc = &ToolCall{}
+				toolCallBuilders[key] = tc
+			}
+			if d.ID != "" {
+				tc.ID = d.ID
+			}
+			if d.FunctionName != "" {
+				tc.Name = d.FunctionName
+			}
+			if d.FunctionArguments != "" {
+				tc.Arguments += d.FunctionArguments
+			}
+		}
+	}
+
+	if len(toolCallBuilders) > 0 {
+		type keyedTool struct {
+			index int
+			tc    ToolCall
+		}
+		sorted := make([]keyedTool, 0, len(toolCallBuilders))
+
+		for key, tc := range toolCallBuilders {
+			idx := 0
+			if found, ok := toolIDToIndex[key]; ok {
+				idx = found
+			} else {
+				fmt.Sscanf(key, "idx_%d", &idx)
+			}
+			if strings.TrimSpace(tc.ID) == "" {
+				tc.ID = uuid.New().String()
+			}
+			sorted = append(sorted, keyedTool{index: idx, tc: *tc})
+		}
+
+		sort.Slice(sorted, func(i, j int) bool {
+			return sorted[i].index < sorted[j].index
+		})
+
+		for _, kt := range sorted {
+			execMu.Lock()
+			alreadyStarted := execStarted[kt.index]
+			execMu.Unlock()
+			if !alreadyStarted && kt.tc.Name != "" {
+				tryExec(kt.index, kt.tc)
+			}
+		}
+
+		finishExec()
+
+		execMu.Lock()
+		for _, kt := range sorted {
+			if kt.tc.Name == "" {
+				continue
+			}
+			toolCalls = append(toolCalls, kt.tc)
+			if earlyResults != nil {
+				*earlyResults = append(*earlyResults, execResults[kt.index])
+			}
+		}
+		execMu.Unlock()
+	} else {
+		finishExec()
+	}
+
+	return singleTurnResult{
+		content:          assistantText,
+		reasoning:        reasoningText,
+		reasoningDetails: details,
+		providerMeta:     meta,
+		toolCalls:        toolCalls,
+		totalTokens:      lastTotalTokens,
+	}, retrySafe, nil
+}
+
+func (r Runner) emitRetry(status RetryStatus) {
+	if r.Observer.OnRetry != nil {
+		r.Observer.OnRetry(status)
+	}
+}
+
+func (r Runner) emitCompression(status CompressionStatus) {
+	if r.Observer.OnCompression != nil {
+		r.Observer.OnCompression(status)
+	}
+}
+
+func (r Runner) emitAssistantDelta(delta Delta) {
+	if r.Observer.OnAssistantDelta != nil {
+		r.Observer.OnAssistantDelta(delta)
+	}
+}
+
+func (r Runner) emitToolCall(call ToolCall) {
+	if r.Observer.OnToolCall != nil {
+		r.Observer.OnToolCall(call)
+	}
+}
+
+func (r Runner) emitToolCallDelta(delta provider.ToolCallDelta) {
+	if r.Observer.OnToolCallDelta != nil {
+		r.Observer.OnToolCallDelta(delta)
+	}
+}
+
+func (r Runner) emitToolOutput(output ToolOutput) {
+	if r.Observer.OnToolOutput != nil {
+		r.Observer.OnToolOutput(output)
+	}
+}
