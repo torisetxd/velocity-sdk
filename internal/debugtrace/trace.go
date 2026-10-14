@@ -11,10 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-)
 
-const traceEnv = "VELOCITY_STREAM_DEBUG"
-const rawTraceEnv = "VELOCITY_STREAM_DEBUG_RAW"
+	"velocitylabs.cc/sdk"
+)
 
 var (
 	initOnce sync.Once
@@ -73,8 +72,9 @@ func Raw(event string, fields map[string]any, payload string) {
 
 func ensureSinks() {
 	initOnce.Do(func() {
-		sink = openSink(os.Getenv(traceEnv))
-		rawSink = openSink(os.Getenv(rawTraceEnv))
+		settings := sdk.Current()
+		sink = openSink(settings.DebugValue(os.Getenv, ""))
+		rawSink = openSink(settings.DebugValue(os.Getenv, "_RAW"))
 	})
 }
 
@@ -89,7 +89,7 @@ func openSink(raw string) io.Writer {
 
 	file, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "velocity stream debug: open %s: %v\n", target, err)
+		fmt.Fprintf(os.Stderr, "%s: open %s: %v\n", sdk.Current().DebugEnv, target, err)
 		return io.Discard
 	}
 	return file

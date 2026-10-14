@@ -560,7 +560,7 @@ func formatStreamError(status string, requestBody, responseBody []byte) error {
 
 	msg := fmt.Sprintf("stream API error (%s): %s", status, bodySummary)
 
-	if os.Getenv("VELOCITY_STREAM_DEBUG") != "" {
+	if sdk.Current().DebugValue(os.Getenv, "") != "" {
 		if requestPath, err := dumpPayload(sdk.Current().TempPrefix+"request-*.json", requestBody); err == nil {
 			msg += fmt.Sprintf("\nrequest: %s", requestPath)
 		}
