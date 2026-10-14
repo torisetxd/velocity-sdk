@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"velocitylabs.cc/sdk"
 )
 
 type openRouterProvider struct {
@@ -56,9 +58,13 @@ func (p *openRouterProvider) StreamChat(ctx context.Context, req ChatRequest) (C
 		return nil, err
 	}
 
-	headers := map[string]string{
-		"HTTP-Referer": "https://velocitylabs.cc",
-		"X-Title":      "Velocity",
+	headers := map[string]string{}
+	settings := sdk.Current()
+	if settings.AppURL != "" {
+		headers["HTTP-Referer"] = settings.AppURL
+	}
+	if settings.AppName != "" {
+		headers["X-Title"] = settings.AppName
 	}
 
 	return streamChatCompletions(
