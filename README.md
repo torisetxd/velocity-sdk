@@ -14,3 +14,20 @@ Standalone Go SDK for multi-provider LLM streaming, context management, and agen
 ```sh
 go get velocitylabs.cc/sdk@latest
 ```
+
+## Configuration
+
+Process-wide settings live in the root package. Call `Configure` once at startup; empty fields keep their defaults.
+
+```go
+import "velocitylabs.cc/sdk"
+
+sdk.Configure(sdk.Settings{
+	AppName:        "MyApp",              // OpenRouter X-Title (none by default)
+	AppURL:         "https://myapp.dev",  // OpenRouter HTTP-Referer (none by default)
+	CacheKeyPrefix: "myapp-session-",     // default "velocity-session-"
+	TempPrefix:     "myapp-",             // default "velocity-"
+	DebugEnv:       "MYAPP_STREAM_DEBUG", // default "VELOCITY_STREAM_DEBUG" (+ "_RAW")
+	// DisableDebugEnv: true,             // ignore the debug env var entirely
+})
+```
