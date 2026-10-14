@@ -92,7 +92,9 @@ type CompressionStatus struct {
 }
 
 // FileReader loads a workspace-relative file during context compression so
-// callers can read retained files from a container, remote volume, or disk.
+// callers can read retained files from a container, remote volume, or disk
+// (see DirFileReader). Supplying one enables file retention: the compression
+// prompt asks for a <files_to_retain> block and those files are carried over.
 type FileReader func(ctx stdctx.Context, relPath string) ([]byte, error)
 
 func CloneGoal(g *GoalState) *GoalState {

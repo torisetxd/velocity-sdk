@@ -56,7 +56,7 @@ func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRe
 		Model: model.Model,
 		Messages: append(renderedHistory, provider.ChatMessage{
 			Role:    "user",
-			Content: compressionUserRequest(),
+			Content: compressionUserRequest(opts.FileReader != nil),
 		}),
 		Tools:          append([]provider.ToolDef(nil), opts.Tools...),
 		ToolChoice:     "none",
@@ -546,8 +546,8 @@ func formatContentForCompression(content any) string {
 	}
 }
 
-func compressionUserRequest() string {
-	return `This is a context-compression handoff. After you respond, ALL prior conversation context will be discarded and unavailable. Your response is the only context the next continuation will have, so it is REQUIRED to preserve EVERYTHING relevant to continuing the work accurately. Do not omit details just to be concise.
+func compressionUserRequest(retainFiles bool) string {
+	prompt := `This is a context-compression handoff. After you respond, ALL prior conversation context will be discarded and unavailable. Your response is the only context the next continuation will have, so it is REQUIRED to preserve EVERYTHING relevant to continuing the work accurately. Do not omit details just to be concise.
 
 You are NOT allowed to make tool calls. Do not attempt to use tools, request tools, or continue the task. Return only the complete compression response now.
 
@@ -561,7 +561,11 @@ Capture:
 - attempts that failed or were abandoned, and why, so they are not repeated
 - relevant commands, configuration, outputs, and other details needed to resume without the prior context
 
-Write the response so another session can pick up exactly where we are without asking for information already present in the conversation. Be exhaustive about relevant details and specific; remove only irrelevant noise. Use clear structure where helpful.
+Write the response so another session can pick up exactly where we are without asking for information already present in the conversation. Be exhaustive about relevant details and specific; remove only irrelevant noise. Use clear structure where helpful.`
+	if !retainFiles {
+		return prompt
+	}
+	return prompt + `
 
 CRITICAL - ACTIVE FILES RETENTION:
 If your immediate next continuation turn requires inspecting active code files to continue editing, refactoring, or implementing without re-reading them, specify up to 3-5 files at the very end of your response inside a <files_to_retain> block:

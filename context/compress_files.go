@@ -113,6 +113,38 @@ func ParseFileSpecs(raw string) []FileSpec {
 	return specs
 }
 
+// DirFileReader reads retained files from root on the local disk, refusing
+// paths outside it.
+func DirFileReader(root string) FileReader {
+	baseDir := strings.TrimSpace(root)
+	if baseDir == "" {
+		baseDir = "."
+	}
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		absBase = baseDir
+	}
+	return func(_ stdctx.Context, p string) ([]byte, error) {
+		var targetPath string
+		if filepath.IsAbs(p) {
+			targetPath = filepath.Clean(p)
+		} else {
+			targetPath = filepath.Clean(filepath.Join(absBase, p))
+		}
+		rel, err := filepath.Rel(absBase, targetPath)
+		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			return nil, fmt.Errorf("path outside root")
+		}
+		info, err := os.Stat(targetPath)
+		if err != nil || info.IsDir() || info.Size() == 0 || info.Size() > maxRetainedFileSizeBytes {
+			return nil, fmt.Errorf("invalid file")
+		}
+		return os.ReadFile(targetPath)
+	}
+}
+
+// LoadRetainedFiles reads the files listed in a <files_to_retain> block. It
+// returns nothing when reader is nil, since file retention is then disabled.
 func LoadRetainedFiles(ctx stdctx.Context, root string, raw string, reader FileReader) []RetainedFile {
 	specs := ParseFileSpecs(raw)
 	if len(specs) == 0 {
@@ -120,31 +152,7 @@ func LoadRetainedFiles(ctx stdctx.Context, root string, raw string, reader FileR
 	}
 
 	if reader == nil {
-		baseDir := strings.TrimSpace(root)
-		if baseDir == "" {
-			baseDir = "."
-		}
-		absBase, err := filepath.Abs(baseDir)
-		if err != nil {
-			absBase = baseDir
-		}
-		reader = func(_ stdctx.Context, p string) ([]byte, error) {
-			var targetPath string
-			if filepath.IsAbs(p) {
-				targetPath = filepath.Clean(p)
-			} else {
-				targetPath = filepath.Clean(filepath.Join(absBase, p))
-			}
-			rel, err := filepath.Rel(absBase, targetPath)
-			if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-				return nil, fmt.Errorf("path outside root")
-			}
-			info, err := os.Stat(targetPath)
-			if err != nil || info.IsDir() || info.Size() == 0 || info.Size() > maxRetainedFileSizeBytes {
-				return nil, fmt.Errorf("invalid file")
-			}
-			return os.ReadFile(targetPath)
-		}
+		return nil
 	}
 
 	retained := make([]RetainedFile, 0, len(specs))
