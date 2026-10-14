@@ -30,6 +30,13 @@ type CompressionStatus = vcontext.CompressionStatus
 type CompressionResult = vcontext.CompressionResult
 type CompressionRequestOptions = vcontext.CompressionRequestOptions
 type FileReader = vcontext.FileReader
+type ContextSection = vcontext.ContextSection
+type DiffMode = vcontext.DiffMode
+
+const (
+	DiffWhole = vcontext.DiffWhole
+	DiffLines = vcontext.DiffLines
+)
 
 var (
 	UserEvent                         = vcontext.UserEvent
@@ -105,20 +112,23 @@ func (f FuncToolExecutor) Execute(ctx context.Context, call ToolCall, onOutput f
 }
 
 type Runner struct {
-	Provider               provider.Provider
-	Tools                  ToolExecutor
-	Model                  ModelRef
-	ModelExtra             map[string]any
-	Root                   string
-	FileReader             FileReader
-	Observer               Observer
-	ContinuationPrompt     string
-	ContinuationPromptFn   func() string
-	PromptCacheEnabled     bool
-	PipelinedTools         bool
-	Steer                  func() []string
-	InternalMessages       func() []string
-	InternalContext        func(lastInternal string) string
+	Provider             provider.Provider
+	Tools                ToolExecutor
+	Model                ModelRef
+	ModelExtra           map[string]any
+	Root                 string
+	FileReader           FileReader
+	Observer             Observer
+	ContinuationPrompt   string
+	ContinuationPromptFn func() string
+	PromptCacheEnabled   bool
+	PipelinedTools       bool
+	Steer                func() []string
+	InternalMessages     func() []string
+	// InternalContext registers the sections of volatile context (date, cwd,
+	// uploads, ...) sent as <internal_context> messages instead of in the
+	// system prompt. Only changes are appended, keeping the prompt cache warm.
+	InternalContext        []ContextSection
 	TransformUserPrompt    func(ctx context.Context, prompt string) any
 	PrepareMessages        func(ctx context.Context, messages []provider.ChatMessage) []provider.ChatMessage
 	DecorateAssistantEvent func(ev *Event)

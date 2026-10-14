@@ -6,29 +6,65 @@ import (
 	"velocitylabs.cc/sdk/provider"
 )
 
+const internalContextTag = "internal_context"
+
+// DiffMode controls how a changed ContextSection is re-sent to the model.
+type DiffMode int
+
 const (
-	internalContextTag = "internal_context"
-	projectTreeTag     = "project_tree"
+	// DiffWhole re-sends the whole section whenever its body changes.
+	DiffWhole DiffMode = iota
+	// DiffLines treats the body as "Key: value" lines and re-sends only the
+	// lines that changed. Removing a key re-sends the whole section.
+	DiffLines
 )
 
-func FlushInternalContext(history *[]Event, renderedHistory *[]provider.ChatMessage, caps provider.Capabilities, fn func(lastInternal string) string) {
-	if fn == nil || history == nil {
-		return
-	}
-	lastContent, hasSnapshot := InternalContextSnapshot(*history)
-	if !hasSnapshot && LastBoundaryIndex(*history) < 0 {
-		lastContent = LastInternalContent(*history)
-	}
-	content := strings.TrimSpace(fn(lastContent))
-	if content == "" {
-		return
-	}
-	if hasSnapshot {
-		content = InternalContextDelta(lastContent, content)
-		if content == "" {
-			return
+// ContextSection is one tagged block of internal context. The runner calls
+// every section's Build before each model step, diffs the result against what
+// the model has already seen, and appends only the changes to the history, so
+// volatile context never invalidates the prompt-cache prefix.
+type ContextSection struct {
+	Tag  string
+	Diff DiffMode
+	// Build returns the section's current body. last is the full internal
+	// context the model has seen so far ("" when none). Returning ok=false
+	// leaves the section as it was last sent, or omits it if it never was. An
+	// empty body removes the section.
+	Build func(last string) (body string, ok bool)
+}
+
+// InternalContextPrompt explains internal context messages to the model, for
+// inclusion in the system prompt.
+func InternalContextPrompt(sections []ContextSection) string {
+	var lineTags []string
+	for _, section := range sections {
+		if section.Diff == DiffLines {
+			lineTags = append(lineTags, "<"+section.Tag+">")
 		}
-	} else if lastContent == content {
+	}
+	prompt := "Messages wrapped in <" + internalContextTag + "> tags are injected automatically by the system, not sent by the user. Treat them as part of the system prompt and never mention them explicitly. Messages with <" + internalContextTag + ` update="true"> are deltas from the most recent full internal context: an included section replaces its prior version in full, omitted sections retain their prior values, and an empty section clears its prior value.`
+	if len(lineTags) > 0 {
+		prompt += " Exception: in an update, " + strings.Join(lineTags, ", ") + ` list only changed "Key: value" fields unless marked replace="true", which replaces the full section.`
+	}
+	return prompt
+}
+
+type contextBlock struct {
+	tag   string
+	attrs string
+	body  string
+}
+
+// FlushInternalContext builds sections and appends whatever the model has not
+// seen yet: the full context on first use (or after a compression boundary),
+// otherwise an update holding only the sections that changed.
+func FlushInternalContext(history *[]Event, renderedHistory *[]provider.ChatMessage, caps provider.Capabilities, sections []ContextSection) {
+	if len(sections) == 0 || history == nil {
+		return
+	}
+	last, _ := InternalContextSnapshot(*history, sections)
+	content := InternalContextUpdate(last, sections)
+	if content == "" {
 		return
 	}
 	ev := InternalEvent(content)
@@ -36,6 +72,96 @@ func FlushInternalContext(history *[]Event, renderedHistory *[]provider.ChatMess
 	if renderedHistory != nil {
 		*renderedHistory = append(*renderedHistory, EventToProviderMessage(ev, caps))
 	}
+}
+
+// InternalContextUpdate builds sections against last (a snapshot as returned
+// by InternalContextSnapshot) and returns the internal context message to
+// append, or "" when nothing changed.
+func InternalContextUpdate(last string, sections []ContextSection) string {
+	previous, hasPrevious := parseInternalContext(last)
+	var out []contextBlock
+	for _, section := range sections {
+		if section.Build == nil || section.Tag == "" {
+			continue
+		}
+		body, ok := section.Build(last)
+		if !ok {
+			continue
+		}
+		body = strings.TrimSpace(body)
+		prev, had := findBlock(previous.blocks, section.Tag)
+		if !hasPrevious {
+			if body != "" {
+				out = append(out, contextBlock{tag: section.Tag, body: body})
+			}
+			continue
+		}
+		switch {
+		case body == "":
+			if had {
+				out = append(out, contextBlock{tag: section.Tag})
+			}
+		case !had:
+			out = append(out, contextBlock{tag: section.Tag, body: body})
+		case section.Diff == DiffLines:
+			if changed, replace := changedLines(prev.body, body); changed != "" {
+				block := contextBlock{tag: section.Tag, body: changed}
+				if replace {
+					block.attrs = ` replace="true"`
+				}
+				out = append(out, block)
+			}
+		case prev.body != body:
+			out = append(out, contextBlock{tag: section.Tag, body: body})
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return renderInternalContext(out, hasPrevious)
+}
+
+// InternalContextSnapshot returns everything the model has been told through
+// internal context since the last compression boundary, with updates merged
+// in, rendered as one full internal context message.
+func InternalContextSnapshot(history []Event, sections []ContextSection) (string, bool) {
+	var snapshot []contextBlock
+	has := false
+	for _, event := range history[LastBoundaryIndex(history)+1:] {
+		if event.Kind != EventKindInternal {
+			continue
+		}
+		content, ok := event.Content.(string)
+		if !ok {
+			continue
+		}
+		parsed, ok := parseInternalContext(content)
+		if !ok || !anyRegistered(parsed.blocks, sections) {
+			continue
+		}
+		if !parsed.update {
+			snapshot, has = parsed.blocks, true
+			continue
+		}
+		if has {
+			snapshot = mergeBlocks(snapshot, parsed.blocks, sections)
+		}
+	}
+	if !has {
+		return "", false
+	}
+	return renderInternalContext(snapshot, false), true
+}
+
+// InternalContextSection returns the body of tag inside an internal context
+// message, such as the snapshot handed to ContextSection.Build.
+func InternalContextSection(content, tag string) (string, bool) {
+	parsed, ok := parseInternalContext(content)
+	if !ok {
+		return "", false
+	}
+	block, ok := findBlock(parsed.blocks, tag)
+	return block.body, ok
 }
 
 func LastInternalContent(history []Event) string {
@@ -50,106 +176,175 @@ func LastInternalContent(history []Event) string {
 	return ""
 }
 
-func InternalContextSnapshot(history []Event) (string, bool) {
-	start := LastBoundaryIndex(history) + 1
-	snapshot := ""
-	for _, event := range history[start:] {
-		if event.Kind != EventKindInternal {
+type parsedContext struct {
+	blocks []contextBlock
+	update bool
+}
+
+// parseInternalContext reads a message made only of top-level tagged blocks
+// inside <internal_context>. Free-form internal messages fail to parse, so
+// they are never mistaken for snapshots.
+func parseInternalContext(content string) (parsedContext, bool) {
+	s := strings.TrimSpace(content)
+	var parsed parsedContext
+	switch {
+	case strings.HasPrefix(s, "<"+internalContextTag+` update="true">`):
+		parsed.update = true
+		s = s[len("<"+internalContextTag+` update="true">`):]
+	case strings.HasPrefix(s, "<"+internalContextTag+">"):
+		s = s[len("<"+internalContextTag+">"):]
+	default:
+		return parsedContext{}, false
+	}
+	closing := "</" + internalContextTag + ">"
+	if !strings.HasSuffix(s, closing) {
+		return parsedContext{}, false
+	}
+	s = strings.TrimSpace(strings.TrimSuffix(s, closing))
+	for s != "" {
+		if s[0] != '<' {
+			return parsedContext{}, false
+		}
+		end := strings.IndexByte(s, '>')
+		if end < 0 {
+			return parsedContext{}, false
+		}
+		tag, attrs, _ := strings.Cut(s[1:end], " ")
+		if tag == "" || strings.HasPrefix(tag, "/") {
+			return parsedContext{}, false
+		}
+		rest := s[end+1:]
+		closeTag := "</" + tag + ">"
+		i := strings.Index(rest, closeTag)
+		if i < 0 {
+			return parsedContext{}, false
+		}
+		block := contextBlock{tag: tag, body: strings.TrimSpace(rest[:i])}
+		if attrs != "" {
+			block.attrs = " " + attrs
+		}
+		parsed.blocks = append(parsed.blocks, block)
+		s = strings.TrimSpace(rest[i+len(closeTag):])
+	}
+	return parsed, len(parsed.blocks) > 0
+}
+
+func renderInternalContext(blocks []contextBlock, update bool) string {
+	open := "<" + internalContextTag + ">"
+	if update {
+		open = "<" + internalContextTag + ` update="true">`
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if block.body == "" {
+			parts = append(parts, "<"+block.tag+block.attrs+"></"+block.tag+">")
 			continue
 		}
-		content, ok := event.Content.(string)
-		if !ok || !hasContextSection(content, "system") {
-			continue
+		parts = append(parts, "<"+block.tag+block.attrs+">\n"+block.body+"\n</"+block.tag+">")
+	}
+	return open + "\n" + strings.Join(parts, "\n\n") + "\n</" + internalContextTag + ">"
+}
+
+func mergeBlocks(snapshot, update []contextBlock, sections []ContextSection) []contextBlock {
+	snapshot = append([]contextBlock(nil), snapshot...)
+	for _, block := range update {
+		index := -1
+		for i := range snapshot {
+			if snapshot[i].tag == block.tag {
+				index = i
+				break
+			}
 		}
-		content = strings.TrimSpace(content)
-		if isInternalContextUpdate(content) {
-			if snapshot != "" {
-				snapshot = mergeInternalContext(snapshot, content)
+		if block.body == "" {
+			if index >= 0 {
+				snapshot = append(snapshot[:index], snapshot[index+1:]...)
 			}
 			continue
 		}
-		snapshot = content
-	}
-	return snapshot, snapshot != ""
-}
-
-func InternalContextDelta(previous, current string) string {
-	previousSystem, previousHasSystem := contextSection(previous, "system")
-	currentSystem, currentHasSystem := contextSection(current, "system")
-	if !previousHasSystem || !currentHasSystem {
-		if previous == current {
-			return ""
+		body := block.body
+		if index >= 0 && diffMode(sections, block.tag) == DiffLines && !strings.Contains(block.attrs, `replace="true"`) {
+			body = mergeLines(snapshot[index].body, block.body)
 		}
-		return current
-	}
-
-	sections := make([]string, 0, 3)
-	if system, replace := changedSystemSection(previousSystem.body, currentSystem.body); system != "" {
-		if replace {
-			sections = append(sections, renderContextSection("system", " replace=\"true\"", system))
+		if index >= 0 {
+			snapshot[index] = contextBlock{tag: block.tag, body: body}
 		} else {
-			sections = append(sections, renderContextSection("system", "", system))
+			snapshot = append(snapshot, contextBlock{tag: block.tag, body: body})
 		}
 	}
-
-	previousSkills, previousHasSkills := contextSection(previous, "available_skills")
-	currentSkills, currentHasSkills := contextSection(current, "available_skills")
-	if previousHasSkills != currentHasSkills || (previousHasSkills && previousSkills.body != currentSkills.body) {
-		sections = append(sections, contextSectionUpdate("available_skills", currentSkills, currentHasSkills))
-	}
-
-	if contextCWD(previous) != contextCWD(current) {
-		previousTree, previousHasTree := contextSection(previous, projectTreeTag)
-		currentTree, currentHasTree := contextSection(current, projectTreeTag)
-		if previousHasTree != currentHasTree || (previousHasTree && previousTree.body != currentTree.body) {
-			sections = append(sections, contextSectionUpdate(projectTreeTag, currentTree, currentHasTree))
-		}
-	}
-
-	if len(sections) == 0 {
-		return ""
-	}
-	return "<" + internalContextTag + " update=\"true\">\n" + strings.Join(sections, "\n\n") + "\n</" + internalContextTag + ">"
+	return snapshot
 }
 
-func contextCWD(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "Current Working Directory: ") {
-			continue
+func findBlock(blocks []contextBlock, tag string) (contextBlock, bool) {
+	for _, block := range blocks {
+		if block.tag == tag {
+			return block, true
 		}
-		val := strings.TrimPrefix(line, "Current Working Directory: ")
-		if i := strings.Index(val, " ("); i >= 0 {
-			val = val[:i]
-		}
-		return strings.TrimSpace(val)
 	}
-	return ""
+	return contextBlock{}, false
 }
 
-func changedSystemSection(previous, current string) (string, bool) {
+func anyRegistered(blocks []contextBlock, sections []ContextSection) bool {
+	for _, block := range blocks {
+		for _, section := range sections {
+			if section.Tag == block.tag {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func diffMode(sections []ContextSection, tag string) DiffMode {
+	for _, section := range sections {
+		if section.Tag == tag {
+			return section.Diff
+		}
+	}
+	return DiffWhole
+}
+
+// changedLines returns the lines of current whose key differs from previous.
+// When a key was removed it returns all of current and replace=true.
+func changedLines(previous, current string) (string, bool) {
 	previousLines := contextLines(previous)
 	currentLines := contextLines(current)
-	previousByField := make(map[string]string, len(previousLines))
+	previousByKey := make(map[string]string, len(previousLines))
 	for _, line := range previousLines {
-		previousByField[contextField(line)] = line
+		previousByKey[lineKey(line)] = line
 	}
-
 	changed := make([]string, 0, len(currentLines))
-	currentFields := make(map[string]struct{}, len(currentLines))
+	currentKeys := make(map[string]struct{}, len(currentLines))
 	for _, line := range currentLines {
-		field := contextField(line)
-		currentFields[field] = struct{}{}
-		if previousByField[field] != line {
+		key := lineKey(line)
+		currentKeys[key] = struct{}{}
+		if previousByKey[key] != line {
 			changed = append(changed, line)
 		}
 	}
-	for field := range previousByField {
-		if _, ok := currentFields[field]; !ok {
+	for key := range previousByKey {
+		if _, ok := currentKeys[key]; !ok {
 			return strings.Join(currentLines, "\n"), true
 		}
 	}
 	return strings.Join(changed, "\n"), false
+}
+
+func mergeLines(previous, update string) string {
+	lines := contextLines(previous)
+	positions := make(map[string]int, len(lines))
+	for index, line := range lines {
+		positions[lineKey(line)] = index
+	}
+	for _, line := range contextLines(update) {
+		key := lineKey(line)
+		if index, ok := positions[key]; ok {
+			lines[index] = line
+			continue
+		}
+		positions[key] = len(lines)
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func contextLines(content string) []string {
@@ -163,112 +358,9 @@ func contextLines(content string) []string {
 	return result
 }
 
-func contextField(line string) string {
+func lineKey(line string) string {
 	if index := strings.Index(line, ":"); index >= 0 {
 		return strings.TrimSpace(line[:index])
 	}
 	return line
-}
-
-type internalContextSection struct {
-	raw  string
-	body string
-}
-
-func contextSection(content, tag string) (internalContextSection, bool) {
-	openStart := strings.Index(content, "<"+tag)
-	if openStart < 0 {
-		return internalContextSection{}, false
-	}
-	openEndOffset := strings.Index(content[openStart:], ">")
-	if openEndOffset < 0 {
-		return internalContextSection{}, false
-	}
-	openEnd := openStart + openEndOffset
-	closeTag := "</" + tag + ">"
-	closeStartOffset := strings.Index(content[openEnd+1:], closeTag)
-	if closeStartOffset < 0 {
-		return internalContextSection{}, false
-	}
-	closeStart := openEnd + 1 + closeStartOffset
-	closeEnd := closeStart + len(closeTag)
-	return internalContextSection{
-		raw:  content[openStart:closeEnd],
-		body: content[openEnd+1 : closeStart],
-	}, true
-}
-
-func hasContextSection(content, tag string) bool {
-	_, ok := contextSection(content, tag)
-	return ok
-}
-
-func isInternalContextUpdate(content string) bool {
-	return strings.HasPrefix(strings.TrimSpace(content), "<"+internalContextTag+" update=\"true\">")
-}
-
-func contextSectionUpdate(tag string, section internalContextSection, present bool) string {
-	if present {
-		return section.raw
-	}
-	return renderContextSection(tag, "", "")
-}
-
-func renderContextSection(tag, attributes, body string) string {
-	if strings.TrimSpace(body) == "" {
-		return "<" + tag + attributes + "></" + tag + ">"
-	}
-	return "<" + tag + attributes + ">\n" + strings.TrimSpace(body) + "\n</" + tag + ">"
-}
-
-func mergeInternalContext(snapshot, update string) string {
-	if system, ok := contextSection(update, "system"); ok {
-		if strings.Contains(system.raw, " replace=\"true\"") {
-			snapshot = replaceContextSection(snapshot, "system", renderContextSection("system", "", system.body))
-		} else if previous, ok := contextSection(snapshot, "system"); ok {
-			snapshot = replaceContextSection(snapshot, "system", renderContextSection("system", "", mergeSystemLines(previous.body, system.body)))
-		}
-	}
-	for _, tag := range []string{"available_skills", projectTreeTag} {
-		section, ok := contextSection(update, tag)
-		if !ok {
-			continue
-		}
-		replacement := ""
-		if strings.TrimSpace(section.body) != "" {
-			replacement = section.raw
-		}
-		snapshot = replaceContextSection(snapshot, tag, replacement)
-	}
-	return snapshot
-}
-
-func mergeSystemLines(previous, update string) string {
-	lines := contextLines(previous)
-	positions := make(map[string]int, len(lines))
-	for index, line := range lines {
-		positions[contextField(line)] = index
-	}
-	for _, line := range contextLines(update) {
-		field := contextField(line)
-		if index, ok := positions[field]; ok {
-			lines[index] = line
-			continue
-		}
-		positions[field] = len(lines)
-		lines = append(lines, line)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func replaceContextSection(content, tag, replacement string) string {
-	section, ok := contextSection(content, tag)
-	if ok {
-		return strings.Replace(content, section.raw, replacement, 1)
-	}
-	if replacement == "" {
-		return content
-	}
-	closingTag := "</" + internalContextTag + ">"
-	return strings.Replace(content, closingTag, "\n"+replacement+"\n"+closingTag, 1)
 }
