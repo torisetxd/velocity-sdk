@@ -560,11 +560,11 @@ func formatStreamError(status string, requestBody, responseBody []byte) error {
 
 	msg := fmt.Sprintf("stream API error (%s): %s", status, bodySummary)
 
-	if sdk.Current().DebugValue(os.Getenv, "") != "" {
-		if requestPath, err := dumpPayload(sdk.Current().TempPrefix+"request-*.json", requestBody); err == nil {
+	if settings := sdk.Current(); !settings.DisableDebugFiles && settings.DebugValue(os.Getenv, "") != "" {
+		if requestPath, err := dumpPayload(settings.TempPrefix+"request-*.json", requestBody); err == nil {
 			msg += fmt.Sprintf("\nrequest: %s", requestPath)
 		}
-		if responsePath, err := dumpPayload(sdk.Current().TempPrefix+"response-*.log", responseBody); err == nil {
+		if responsePath, err := dumpPayload(settings.TempPrefix+"response-*.log", responseBody); err == nil {
 			msg += fmt.Sprintf("\nresponse: %s", responsePath)
 		}
 	}

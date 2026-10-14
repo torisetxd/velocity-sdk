@@ -19,6 +19,9 @@ type Settings struct {
 	DebugEnv string
 	// DisableDebugEnv ignores DebugEnv entirely.
 	DisableDebugEnv bool
+	// DisableDebugFiles stops saving failed request/response payloads to temp
+	// files while debugging is on.
+	DisableDebugFiles bool
 }
 
 // Defaults returns the settings used when Configure is never called.

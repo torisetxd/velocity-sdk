@@ -29,5 +29,6 @@ sdk.Configure(sdk.Settings{
 	TempPrefix:     "myapp-",             // default "velocity-"
 	DebugEnv:       "MYAPP_STREAM_DEBUG", // default "VELOCITY_STREAM_DEBUG" (+ "_RAW")
 	// DisableDebugEnv: true,             // ignore the debug env var entirely
+	// DisableDebugFiles: true,           // never save failed request/response payloads to temp files
 })
 ```
