@@ -3,6 +3,7 @@ package context
 import (
 	stdctx "context"
 
+	"velocitylabs.cc/sdk"
 	"velocitylabs.cc/sdk/provider"
 )
 
@@ -135,7 +136,7 @@ func AssistantEvent(content any, reasoning string, reasoningDetails []map[string
 }
 
 func SessionPromptCacheKey(sessionID string) string {
-	return "velocity-session-" + sessionID
+	return sdk.Current().CacheKeyPrefix + sessionID
 }
 
 func PromptCacheKeyForSession(p provider.Provider, configured bool, sessionID string) string {
