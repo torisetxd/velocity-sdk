@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+	"velocitylabs.cc/sdk"
 )
 
 type TargetSize int64
@@ -376,7 +377,7 @@ func scaleImageNearest(src image.Image, scalePct int) image.Image {
 }
 
 func encodeImageExternal(data []byte, targetFormat string, quality, scalePct int, targetBytes int64) ([]byte, bool) {
-	tmpDir, err := os.MkdirTemp("", "velocity-img-*")
+	tmpDir, err := os.MkdirTemp("", sdk.Current().TempPrefix+"img-*")
 	if err != nil {
 		return nil, false
 	}

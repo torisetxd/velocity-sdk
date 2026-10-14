@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"velocitylabs.cc/sdk"
 	"velocitylabs.cc/sdk/internal/debugtrace"
 )
 
@@ -560,10 +561,10 @@ func formatStreamError(status string, requestBody, responseBody []byte) error {
 	msg := fmt.Sprintf("stream API error (%s): %s", status, bodySummary)
 
 	if os.Getenv("VELOCITY_STREAM_DEBUG") != "" {
-		if requestPath, err := dumpPayload("velocity-request-*.json", requestBody); err == nil {
+		if requestPath, err := dumpPayload(sdk.Current().TempPrefix+"request-*.json", requestBody); err == nil {
 			msg += fmt.Sprintf("\nrequest: %s", requestPath)
 		}
-		if responsePath, err := dumpPayload("velocity-response-*.log", responseBody); err == nil {
+		if responsePath, err := dumpPayload(sdk.Current().TempPrefix+"response-*.log", responseBody); err == nil {
 			msg += fmt.Sprintf("\nresponse: %s", responsePath)
 		}
 	}
