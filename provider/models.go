@@ -30,11 +30,21 @@ func ProviderEndpoint(baseURL, endpoint string) string {
 }
 
 func FetchModelsFromEndpoint(ctx context.Context, apiKey, baseURL string, extraHeaders map[string]string) ([]ModelInfo, error) {
+	return fetchModelList(ctx, apiKey, baseURL, extraHeaders, "")
+}
+
+// fetchModelList GETs the models listing, appending query (without "?") when set.
+func fetchModelList(ctx context.Context, apiKey, baseURL string, extraHeaders map[string]string, query string) ([]ModelInfo, error) {
 	client := &http.Client{Timeout: 25 * time.Second}
 	var lastErr error
 	urls := []string{
 		ProviderEndpoint(baseURL, "models"),
 		strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/models",
+	}
+	if query != "" {
+		for i := range urls {
+			urls[i] += "?" + query
+		}
 	}
 	seenURLs := map[string]bool{}
 	for _, u := range urls {
@@ -126,10 +136,26 @@ func parseModelListJSON(raw []byte) []ModelInfo {
 			}
 			seen[id] = true
 			name, _ := mi["name"].(string)
-			processed = append(processed, ModelInfo{ID: id, Name: strings.TrimSpace(name)})
+			info := ModelInfo{ID: id, Name: strings.TrimSpace(name)}
+			if arch, ok := mi["architecture"].(map[string]any); ok {
+				info.InputModalities = stringList(arch["input_modalities"])
+				info.OutputModalities = stringList(arch["output_modalities"])
+			}
+			processed = append(processed, info)
 		}
 	}
 	return processed
+}
+
+func stringList(v any) []string {
+	arr, _ := v.([]any)
+	var out []string
+	for _, item := range arr {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func copyModelInfos(models []ModelInfo) []ModelInfo {

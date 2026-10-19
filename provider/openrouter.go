@@ -90,8 +90,15 @@ func (p *openRouterProvider) Capabilities() Capabilities {
 	}
 }
 
+// FetchModels lists every model type. OpenRouter's /models only returns
+// text-output models unless output_modalities is given, which would hide
+// embedding, transcription and other models.
 func (p *openRouterProvider) FetchModels(ctx context.Context) ([]ModelInfo, error) {
-	return p.base.FetchModels(ctx)
+	token, err := p.base.resolveToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return fetchModelList(ctx, token, p.base.apiURL, p.base.extraHeaders, "output_modalities=all")
 }
 
 func (p *openRouterProvider) FetchUsage(ctx context.Context) (UsageInfo, error) {

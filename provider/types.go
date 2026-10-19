@@ -96,6 +96,11 @@ type ModelInfo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
+	// InputModalities and OutputModalities come from the listing's
+	// architecture block when the provider reports one (e.g. OpenRouter):
+	// "text", "image", "audio", "embeddings", "transcription", ...
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
 }
 
 type ChatStream interface {
