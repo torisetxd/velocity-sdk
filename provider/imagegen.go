@@ -93,7 +93,7 @@ func sniffImageMIME(data []byte, fallback string) string {
 	return "image/png"
 }
 
-func setImageAuth(ctx context.Context, req *http.Request, apiKey string, ts TokenSource) error {
+func setBearerAuth(ctx context.Context, req *http.Request, apiKey string, ts TokenSource) error {
 	token := apiKey
 	if ts != nil {
 		var err error
@@ -155,7 +155,7 @@ func (g *openAIImageGenerator) GenerateImage(ctx context.Context, req ImageReque
 	if err != nil {
 		return ImageResult{}, err
 	}
-	if err := setImageAuth(ctx, httpReq, g.apiKey, g.tokenSource); err != nil {
+	if err := setBearerAuth(ctx, httpReq, g.apiKey, g.tokenSource); err != nil {
 		return ImageResult{}, err
 	}
 	raw, err := doImageRequest(g.httpClient, httpReq)
@@ -413,7 +413,7 @@ func (g *openRouterImageGenerator) once(ctx context.Context, body []byte) (Image
 	if settings.AppName != "" {
 		httpReq.Header.Set("X-Title", settings.AppName)
 	}
-	if err := setImageAuth(ctx, httpReq, g.apiKey, g.tokenSource); err != nil {
+	if err := setBearerAuth(ctx, httpReq, g.apiKey, g.tokenSource); err != nil {
 		return ImageResult{}, err
 	}
 	raw, err := doImageRequest(g.httpClient, httpReq)
