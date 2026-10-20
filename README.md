@@ -7,6 +7,7 @@ Standalone Go SDK for multi-provider LLM streaming, context management, and agen
 - **`velocitylabs.cc/sdk/provider`** — Streaming LLM providers (`openai-compatible`, `openrouter`, `responses`, `copilot`, `copilot-responses`, `chatgpt`, `xai`, `crof`, `zen`, `cline`), capability reporting, reasoning & `reasoning_details` persistence, PNG CRC repair, image compression, model discovery, non-SSE JSON completion fallback, and speech-to-text `Transcriber`s (OpenAI-style multipart `/audio/transcriptions` with optional SSE deltas, OpenRouter's JSON transcription endpoint, and chat-model audio input via `input_audio` with a customizable prompt). Credentials/tokens are injected by the host application (`APIKey` or `TokenSource`).
 - **`velocitylabs.cc/sdk/inference`** — Provider `Registry`, `Router`, `Config`, automatic provider type detection, and `NewTranscriber` (`openai`, `openrouter`, `chat`).
 - **`velocitylabs.cc/sdk/context`** — Append-only `Event` log, capability-aware `RenderHistory`, token ceiling `ModelLimit`, registrable `ContextSection` internal context (only changed sections/lines are appended, so volatile context never breaks the prompt cache), and and prompt-cache-preserving `CompressConversation`, with optional `<files_to_retain>` file carry-over enabled by supplying a `FileReader` (`DirFileReader` for local disk).
+- **`velocitylabs.cc/sdk/webfetch`** — `web_fetch` tool: markdown-first URL fetching (`.md`, `.mdx`, `Accept: text/markdown`, then boilerplate-pruned HTML conversion), binary-payload notices, token-budgeted output, Cloudflare email decoding, an SSRF-safe `NewSafeClient`, and an opt-in crawler-spoof ladder (Googlebot, Bingbot, GPTBot, ChatGPT-User, ClaudeBot, PerplexityBot, ...) for pages that serve a bot wall to unknown clients.
 - **`velocitylabs.cc/sdk/agent`** — Streamed `Runner` with `ToolExecutor` interface, pipelined tool execution, 429/5xx/empty-response retries, optional tool-round safety ceiling, and mid-run `AutoCompress` / `Steer` hooks.
 
 ## Install
@@ -32,6 +33,18 @@ sdk.Configure(sdk.Settings{
 	// DisableDebugFiles: true,           // never save failed request/response payloads to temp files
 })
 ```
+
+## Web fetch
+
+```go
+out, err := webfetch.Fetch(ctx, "https://example.com/docs", webfetch.Options{
+	Client: webfetch.NewSafeClient(30 * time.Second), // refuse private/loopback targets
+	Spoof:  true,                                     // retry as crawlers when blocked
+})
+// or register the ready-made tool: webfetch.ToolDef() + webfetch.Execute(ctx, args, opts)
+```
+
+Spoofing only kicks in when the first response is a denial status (401/403/406/429/503...) or a short challenge/CAPTCHA/JS-required page. Sites that verify crawlers by reverse DNS will still refuse the spoofed identities.
 
 ## Transcription
 
