@@ -57,6 +57,14 @@ res, err := g.GenerateImage(ctx, inference.ImageRequest{Model: "google/gemini-2.
 
 `openai` targets `/images/generations` (and `/images/edits` when `Images` are supplied, e.g. `gpt-image-1`, local servers); `openrouter` uses image output through `/chat/completions`. Both accept `b64_json`, data-URI and URL results.
 
+## Speech synthesis
+
+```go
+sp, _ := inference.NewSpeaker(inference.SpeechConfig{APIKey: key}) // or APIURL of a local OpenAI-style TTS server
+res, err := sp.Speak(ctx, inference.SpeechRequest{Model: "gpt-4o-mini-tts", Voice: "alloy", Input: "Hello", Format: "mp3"})
+// res.Audio, res.MIMEType; provider.SpeechStreamer.StreamSpeech writes audio to an io.Writer as it arrives
+```
+
 ## Transcription
 
 ```go
