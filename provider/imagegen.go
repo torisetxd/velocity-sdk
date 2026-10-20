@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
 
 	"velocitylabs.cc/sdk"
@@ -352,10 +353,10 @@ func (g *openRouterImageGenerator) GenerateImage(ctx context.Context, req ImageR
 		"messages":   []map[string]any{{"role": "user", "content": content}},
 		"modalities": []string{"image", "text"},
 	}
-	if req.Size != "" || req.Quality != "" {
+	if ratio := aspectRatio(req.Size); ratio != "" || req.Quality != "" {
 		cfg := map[string]any{}
-		if req.Size != "" {
-			cfg["aspect_ratio"] = req.Size
+		if ratio != "" {
+			cfg["aspect_ratio"] = ratio
 		}
 		if req.Quality != "" {
 			cfg["image_size"] = req.Quality
@@ -460,6 +461,29 @@ func (g *openRouterImageGenerator) once(ctx context.Context, body []byte) (Image
 		result.Usage = &ImageUsage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, TotalTokens: u.TotalTokens, Cost: u.Cost}
 	}
 	return result, nil
+}
+
+// aspectRatio turns a size such as "1536x1024" into "3:2" for providers that
+// take an aspect ratio; "16:9" passes through and anything else is dropped.
+func aspectRatio(size string) string {
+	size = strings.ToLower(strings.TrimSpace(size))
+	if strings.Contains(size, ":") {
+		return size
+	}
+	ws, hs, ok := strings.Cut(size, "x")
+	if !ok {
+		return ""
+	}
+	w, errW := strconv.Atoi(strings.TrimSpace(ws))
+	h, errH := strconv.Atoi(strings.TrimSpace(hs))
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return ""
+	}
+	a, b := w, h
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return fmt.Sprintf("%d:%d", w/a, h/a)
 }
 
 func decodeDataURI(uri string) ([]byte, string, error) {

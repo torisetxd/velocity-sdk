@@ -103,3 +103,11 @@ func TestOpenRouterImageNoImages(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestAspectRatio(t *testing.T) {
+	for in, want := range map[string]string{"1536x1024": "3:2", "1024x1024": "1:1", "16:9": "16:9", "large": "", "": ""} {
+		if got := aspectRatio(in); got != want {
+			t.Errorf("aspectRatio(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
