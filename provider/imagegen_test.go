@@ -111,3 +111,36 @@ func TestAspectRatio(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenRouterImagesEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path != "/api/v1/images" || !strings.Contains(string(body), `"size":"1024x1024"`) || !strings.Contains(string(body), `"input_references"`) {
+			http.Error(w, r.URL.Path+" "+string(body), http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString(tinyPNG) + `","media_type":"image/png"}],"usage":{"prompt_tokens":0,"completion_tokens":4175,"total_tokens":4175,"cost":0.04}}`))
+	}))
+	defer srv.Close()
+
+	res, err := NewOpenRouterImageGenerator(srv.URL+"/api/v1", "k").GenerateImage(context.Background(),
+		ImageRequest{Model: "openai/gpt-image-1", Prompt: "p", Size: "1024x1024", Images: []ImageInput{{Data: tinyPNG}}})
+	if err != nil || len(res.Images) != 1 || res.Usage == nil || res.Usage.Cost != 0.04 {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+}
+
+func TestOpenRouterImagesNoFallbackOnAuthError(t *testing.T) {
+	chat := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat/completions" {
+			chat = true
+		}
+		http.Error(w, "no credits", http.StatusPaymentRequired)
+	}))
+	defer srv.Close()
+
+	if _, err := NewOpenRouterImageGenerator(srv.URL, "k").GenerateImage(context.Background(), ImageRequest{Model: "m", Prompt: "p"}); err == nil || chat {
+		t.Fatalf("err=%v chat=%v", err, chat)
+	}
+}

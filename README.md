@@ -55,7 +55,7 @@ res, err := g.GenerateImage(ctx, inference.ImageRequest{Model: "google/gemini-2.
 // res.Images[i].Data / .MIMEType; res.Usage.Cost is the provider-reported USD charge
 ```
 
-`openai` targets `/images/generations` (and `/images/edits` when `Images` are supplied, e.g. `gpt-image-1`, local servers); `openrouter` uses image output through `/chat/completions`. Both accept `b64_json`, data-URI and URL results.
+`openai` targets `/images/generations` (and `/images/edits` when `Images` are supplied, e.g. `gpt-image-1`, local servers); `openrouter` uses OpenRouter's `/images` endpoint for dedicated image models and falls back to image output through `/chat/completions` for models it does not serve there. Both accept `b64_json`, data-URI and URL results.
 
 ## Speech synthesis
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -116,13 +117,22 @@ func doImageRequest(client *http.Client, req *http.Request) ([]byte, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxImageErrorBytes))
-		return nil, fmt.Errorf("image API error (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &imageAPIError{Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2*maxGeneratedImageSize))
 	if err != nil {
 		return nil, fmt.Errorf("read image response: %w", err)
 	}
 	return raw, nil
+}
+
+type imageAPIError struct {
+	Status int
+	Body   string
+}
+
+func (e *imageAPIError) Error() string {
+	return fmt.Sprintf("image API error (%d): %s", e.Status, e.Body)
 }
 
 // --- OpenAI-style /images/generations and /images/edits ---
@@ -332,10 +342,133 @@ func NewOpenRouterImageGenerator(apiURL, apiKey string) *openRouterImageGenerato
 
 func (g *openRouterImageGenerator) SetTokenSource(ts TokenSource) { g.tokenSource = ts }
 
+// GenerateImage uses OpenRouter's /images endpoint, which serves dedicated
+// image models (gpt-image, flux, ...). Models it does not serve, such as chat
+// models with image output, fall back to /chat/completions.
 func (g *openRouterImageGenerator) GenerateImage(ctx context.Context, req ImageRequest) (ImageResult, error) {
 	if err := req.validate(); err != nil {
 		return ImageResult{}, err
 	}
+	res, err := g.generateViaImages(ctx, req)
+	var apiErr *imageAPIError
+	if err == nil || !errors.As(err, &apiErr) || !imagesEndpointRejectsModel(apiErr.Status) {
+		return res, err
+	}
+	chatRes, chatErr := g.generateViaChat(ctx, req)
+	if chatErr != nil {
+		return ImageResult{}, fmt.Errorf("%w; chat completions fallback: %v", err, chatErr)
+	}
+	return chatRes, nil
+}
+
+// imagesEndpointRejectsModel reports whether a /images failure may mean the
+// model is only served through chat completions, rather than an auth,
+// billing, rate-limit or generation failure that a retry would repeat.
+func imagesEndpointRejectsModel(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusUnprocessableEntity
+}
+
+func (g *openRouterImageGenerator) baseURL() string {
+	base := strings.TrimRight(strings.TrimSpace(g.apiURL), "/")
+	base = strings.TrimSuffix(base, "/chat/completions")
+	base = strings.TrimSuffix(base, "/images")
+	if base == "" {
+		base = "https://openrouter.ai/api/v1"
+	}
+	return base
+}
+
+func (g *openRouterImageGenerator) post(ctx context.Context, endpoint string, payload map[string]any) ([]byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL()+endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	settings := sdk.Current()
+	if settings.AppURL != "" {
+		httpReq.Header.Set("HTTP-Referer", settings.AppURL)
+	}
+	if settings.AppName != "" {
+		httpReq.Header.Set("X-Title", settings.AppName)
+	}
+	if err := setBearerAuth(ctx, httpReq, g.apiKey, g.tokenSource); err != nil {
+		return nil, err
+	}
+	return doImageRequest(g.httpClient, httpReq)
+}
+
+func (g *openRouterImageGenerator) generateViaImages(ctx context.Context, req ImageRequest) (ImageResult, error) {
+	payload := map[string]any{"model": req.Model, "prompt": req.Prompt}
+	if req.N > 1 {
+		payload["n"] = req.N
+	}
+	if size := strings.TrimSpace(req.Size); size != "" {
+		if strings.Contains(size, ":") {
+			payload["aspect_ratio"] = size
+		} else {
+			payload["size"] = size
+		}
+	}
+	if q := strings.TrimSpace(req.Quality); q != "" {
+		payload["quality"] = q
+	}
+	if len(req.Images) > 0 {
+		refs := make([]map[string]any, 0, len(req.Images))
+		for _, img := range req.Images {
+			mimeType := sniffImageMIME(img.Data, img.MIMEType)
+			refs = append(refs, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
+			})
+		}
+		payload["input_references"] = refs
+	}
+	for k, v := range req.ExtraBody {
+		payload[k] = v
+	}
+	raw, err := g.post(ctx, "/images", payload)
+	if err != nil {
+		return ImageResult{}, err
+	}
+	var parsed struct {
+		Data []struct {
+			B64       string `json:"b64_json"`
+			MediaType string `json:"media_type"`
+		} `json:"data"`
+		Usage tokenUsagePayload `json:"usage"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ImageResult{}, fmt.Errorf("decode image response: %w", err)
+	}
+	if parsed.Error != nil && parsed.Error.Message != "" {
+		return ImageResult{}, fmt.Errorf("image API error: %s", parsed.Error.Message)
+	}
+	var result ImageResult
+	for _, item := range parsed.Data {
+		data, err := base64.StdEncoding.DecodeString(item.B64)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		result.Images = append(result.Images, GeneratedImage{Data: data, MIMEType: sniffImageMIME(data, item.MediaType)})
+	}
+	if len(result.Images) == 0 {
+		return ImageResult{}, fmt.Errorf("image API returned no images")
+	}
+	if u := parsed.Usage.normalized(); u != nil {
+		result.Usage = &ImageUsage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, TotalTokens: u.TotalTokens, Cost: u.Cost}
+	}
+	return result, nil
+}
+
+func (g *openRouterImageGenerator) generateViaChat(ctx context.Context, req ImageRequest) (ImageResult, error) {
 	var content any = req.Prompt
 	if len(req.Images) > 0 {
 		parts := []map[string]any{{"type": "text", "text": req.Prompt}}
@@ -368,13 +501,9 @@ func (g *openRouterImageGenerator) GenerateImage(ctx context.Context, req ImageR
 	}
 
 	n := max(req.N, 1)
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return ImageResult{}, err
-	}
 	var result ImageResult
 	for i := 0; i < n; i++ {
-		one, err := g.once(ctx, body)
+		one, err := g.once(ctx, payload)
 		if err != nil {
 			if len(result.Images) > 0 {
 				break
@@ -395,29 +524,8 @@ func (g *openRouterImageGenerator) GenerateImage(ctx context.Context, req ImageR
 	return result, nil
 }
 
-func (g *openRouterImageGenerator) once(ctx context.Context, body []byte) (ImageResult, error) {
-	base := strings.TrimRight(strings.TrimSpace(g.apiURL), "/")
-	base = strings.TrimSuffix(base, "/chat/completions")
-	if base == "" {
-		base = "https://openrouter.ai/api/v1"
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return ImageResult{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-	settings := sdk.Current()
-	if settings.AppURL != "" {
-		httpReq.Header.Set("HTTP-Referer", settings.AppURL)
-	}
-	if settings.AppName != "" {
-		httpReq.Header.Set("X-Title", settings.AppName)
-	}
-	if err := setBearerAuth(ctx, httpReq, g.apiKey, g.tokenSource); err != nil {
-		return ImageResult{}, err
-	}
-	raw, err := doImageRequest(g.httpClient, httpReq)
+func (g *openRouterImageGenerator) once(ctx context.Context, payload map[string]any) (ImageResult, error) {
+	raw, err := g.post(ctx, "/chat/completions", payload)
 	if err != nil {
 		return ImageResult{}, err
 	}
