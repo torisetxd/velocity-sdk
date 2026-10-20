@@ -101,6 +101,9 @@ type ModelInfo struct {
 	// "text", "image", "audio", "embeddings", "transcription", ...
 	InputModalities  []string `json:"input_modalities,omitempty"`
 	OutputModalities []string `json:"output_modalities,omitempty"`
+	// ContextLength is the model's context window in tokens when the listing
+	// reports one (OpenRouter's context_length, vLLM's max_model_len, ...).
+	ContextLength int `json:"context_length,omitempty"`
 }
 
 type ChatStream interface {

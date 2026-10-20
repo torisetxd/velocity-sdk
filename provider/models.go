@@ -141,10 +141,26 @@ func parseModelListJSON(raw []byte) []ModelInfo {
 				info.InputModalities = stringList(arch["input_modalities"])
 				info.OutputModalities = stringList(arch["output_modalities"])
 			}
+			info.ContextLength = contextLength(mi)
 			processed = append(processed, info)
 		}
 	}
 	return processed
+}
+
+// contextLength reads the context window from the field names providers use.
+func contextLength(m map[string]any) int {
+	for _, key := range []string{"context_length", "context_window", "max_model_len", "max_context_length", "max_input_tokens"} {
+		if n, ok := m[key].(float64); ok && n > 0 {
+			return int(n)
+		}
+	}
+	if top, ok := m["top_provider"].(map[string]any); ok {
+		if n, ok := top["context_length"].(float64); ok && n > 0 {
+			return int(n)
+		}
+	}
+	return 0
 }
 
 func stringList(v any) []string {
