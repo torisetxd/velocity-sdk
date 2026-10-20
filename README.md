@@ -47,6 +47,16 @@ out, err := webfetch.Fetch(ctx, "https://example.com/docs", webfetch.Options{
 
 Spoofing only kicks in when the first response is a denial status (401/403/406/429/503...) or a short challenge/CAPTCHA/JS-required page. Sites that verify crawlers by reverse DNS will still refuse the spoofed identities.
 
+## Image generation
+
+```go
+g, _ := inference.NewImageGenerator(inference.ImageConfig{Type: "openrouter", APIKey: key})
+res, err := g.GenerateImage(ctx, inference.ImageRequest{Model: "google/gemini-2.5-flash-image", Prompt: "a lighthouse at dusk"})
+// res.Images[i].Data / .MIMEType; res.Usage.Cost is the provider-reported USD charge
+```
+
+`openai` targets `/images/generations` (and `/images/edits` when `Images` are supplied, e.g. `gpt-image-1`, local servers); `openrouter` uses image output through `/chat/completions`. Both accept `b64_json`, data-URI and URL results.
+
 ## Transcription
 
 ```go
