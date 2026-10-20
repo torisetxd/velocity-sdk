@@ -8,6 +8,9 @@ type TokenUsage struct {
 	TotalTokens      int `json:"total_tokens,omitempty"`
 	CachedTokens     int `json:"cached_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	// Cost is the provider-reported charge in USD (OpenRouter's usage.cost).
+	// Zero means the provider did not report one.
+	Cost float64 `json:"cost,omitempty"`
 }
 
 type tokenUsageDetails struct {
@@ -26,6 +29,7 @@ type tokenUsagePayload struct {
 	CacheCreationInputTokens int               `json:"cache_creation_input_tokens"`
 	PromptTokensDetails      tokenUsageDetails `json:"prompt_tokens_details"`
 	InputTokensDetails       tokenUsageDetails `json:"input_tokens_details"`
+	Cost                     float64           `json:"cost"`
 }
 
 func (u tokenUsagePayload) normalized() *TokenUsage {
@@ -35,6 +39,7 @@ func (u tokenUsagePayload) normalized() *TokenUsage {
 		TotalTokens:      u.TotalTokens,
 		CachedTokens:     firstPositive(u.PromptTokensDetails.CachedTokens, u.InputTokensDetails.CachedTokens, u.PromptTokensDetails.CacheReadTokens, u.InputTokensDetails.CacheReadTokens, u.CacheReadInputTokens),
 		CacheWriteTokens: firstPositive(u.PromptTokensDetails.CacheWriteTokens, u.InputTokensDetails.CacheWriteTokens, u.CacheCreationInputTokens),
+		Cost:             max(u.Cost, 0),
 	}
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
@@ -64,6 +69,9 @@ func TokenUsageMetadata(usage *TokenUsage) map[string]any {
 	}
 	if usage.CacheWriteTokens > 0 {
 		values["cache_write_tokens"] = usage.CacheWriteTokens
+	}
+	if usage.Cost > 0 {
+		values["cost"] = usage.Cost
 	}
 	if len(values) == 0 {
 		return nil
