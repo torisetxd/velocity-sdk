@@ -9,7 +9,10 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 
-	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
 )
 
 var (
@@ -31,9 +34,28 @@ const (
 	EmailIgnore
 )
 
+// newMarkdownConverter builds the converter used for every page. The table
+// plugin has to be registered explicitly: htmltomarkdown.ConvertReader only
+// installs the base and commonmark plugins, so <table> markup degrades into a
+// run of paragraphs and every column relationship is lost. Cells are rendered
+// with minimal padding and preserved newlines to keep the output compact but
+// still valid GFM.
+func newMarkdownConverter() *converter.Converter {
+	return converter.NewConverter(converter.WithPlugins(
+		base.NewBasePlugin(),
+		commonmark.NewCommonmarkPlugin(),
+		table.NewTablePlugin(
+			table.WithNewlineBehavior(table.NewlineBehaviorPreserve),
+			table.WithHeaderPromotion(true),
+			table.WithCellPaddingBehavior(table.CellPaddingBehaviorMinimal),
+			table.WithSkipEmptyRows(true),
+		),
+	))
+}
+
 func convertHTMLToMarkdown(input []byte, mode EmailMode) (string, error) {
 	cleanedHTML := preCleanHTMLForMarkdown(input, mode)
-	markdown, err := htmltomarkdown.ConvertReader(bytes.NewReader(cleanedHTML))
+	markdown, err := newMarkdownConverter().ConvertReader(bytes.NewReader(cleanedHTML))
 	if err != nil {
 		return "", err
 	}
