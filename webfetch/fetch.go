@@ -69,7 +69,9 @@ type Options struct {
 	// ImpersonateOnBlock retries once with DefaultImpersonateProfile after the
 	// agent ladder has been refused. Bot walls fingerprint the handshake, not
 	// the user-agent, so this is what turns a dozen refused ladder requests into
-	// a successful pair.
+	// a successful pair. The attempt is skipped when it cannot help, and a
+	// refusal to dial (a private address, which the impersonating client guards
+	// against) never masks the ladder's own result.
 	ImpersonateOnBlock bool
 }
 
@@ -196,13 +198,22 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 
 	var last response
 	var lastErr error
-	for _, at := range attempts {
+	for index, at := range attempts {
 		resp, err := get(ctx, at.client, opts, rawURL, htmlAccept, at.agent)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, ErrBlockedAddress) {
+			if ctx.Err() != nil {
 				return "", err
 			}
-			lastErr = err
+			// A refusal from an escalated attempt must not mask what the first one
+			// saw: impersonation dials through the SSRF guard, so escalating a
+			// localhost fetch is expected to be refused and the ladder's own
+			// answer should stand.
+			if index == 0 {
+				if errors.Is(err, ErrBlockedAddress) {
+					return "", err
+				}
+				lastErr = err
+			}
 			continue
 		}
 		last, lastErr = resp, nil
