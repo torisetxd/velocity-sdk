@@ -2,7 +2,9 @@
 // markdown. It prefers markdown endpoints (.md, .mdx, Accept: text/markdown),
 // falls back to boilerplate-pruned HTML conversion, reports binary payloads as
 // a short notice, and can retry as a crawler (Googlebot, GPTBot, ...) when a
-// site serves a bot wall to the default client.
+// site serves a bot wall to the default client. Challenge walls score the TLS
+// handshake rather than the user agent, so it can also replay the request over
+// a real browser's TLS and HTTP/2 fingerprint (see ImpersonateClient).
 package webfetch
 
 import (
@@ -27,6 +29,8 @@ const (
 	DefaultMaxBodyBytes = 4 * 1024 * 1024
 	// DefaultUserAgent is presented when Options.UserAgent is empty.
 	DefaultUserAgent = "VelocitySDK/1.0"
+	// htmlAccept is what a browser sends for a document navigation.
+	htmlAccept = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
 )
 
 // Options configures a fetch. The zero value is usable.
@@ -55,6 +59,18 @@ type Options struct {
 	// SkipMarkdownProbes disables the .md/.mdx/Accept probes and fetches the
 	// URL once as HTML.
 	SkipMarkdownProbes bool
+	// Impersonate drives the whole fetch over a real browser's TLS and HTTP/2
+	// fingerprint instead of Go's, using the named profile from
+	// profiles.MappedTLSClients ("chrome_150", "firefox_147", ...). Empty keeps
+	// the stdlib transport. When it is set and the caller pinned no UserAgent or
+	// Agent, the browser identity is presented so the header and the handshake
+	// agree. Client is ignored in that case.
+	Impersonate string
+	// ImpersonateOnBlock retries once with DefaultImpersonateProfile after the
+	// agent ladder has been refused. Bot walls fingerprint the handshake, not
+	// the user-agent, so this is what turns a dozen refused ladder requests into
+	// a successful pair.
+	ImpersonateOnBlock bool
 }
 
 func (o Options) client() *http.Client {
@@ -100,6 +116,15 @@ func (o Options) baseAgent() Agent {
 	return Agent{UserAgent: ua}
 }
 
+// impersonationAgent is the identity to present alongside a browser
+// fingerprint: a pinned caller choice wins, otherwise the browser profile.
+func (o Options) impersonationAgent() Agent {
+	if o.Agent == nil && strings.TrimSpace(o.UserAgent) == "" {
+		return AgentBrowser
+	}
+	return o.baseAgent()
+}
+
 type response struct {
 	status int
 	body   string
@@ -115,6 +140,15 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 	}
 	agent := opts.baseAgent()
 	client := opts.client()
+	impersonating := opts.Impersonate != ""
+	if impersonating {
+		impersonated, err := ImpersonateClient(opts.Impersonate, opts.client().Timeout)
+		if err != nil {
+			return "", err
+		}
+		client = impersonated
+		agent = opts.impersonationAgent()
+	}
 
 	if !opts.SkipMarkdownProbes {
 		trimmed := strings.TrimSuffix(rawURL, "/")
@@ -137,19 +171,33 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 		}
 	}
 
-	ladder := []Agent{agent}
+	// Attempts run in increasing order of effort: the pinned identity, then a
+	// browser handshake (the dimension a user-agent string cannot reach), and
+	// only then the crawler rungs, which challenge walls tend to refuse outright.
+	type attempt struct {
+		client *http.Client
+		agent  Agent
+	}
+	attempts := []attempt{{client: client, agent: agent}}
+	if opts.ImpersonateOnBlock && !impersonating {
+		if impersonated, err := ImpersonateClient(DefaultImpersonateProfile, opts.client().Timeout); err == nil {
+			attempts = append(attempts, attempt{client: impersonated, agent: opts.impersonationAgent()})
+		}
+	}
 	if opts.Agent == nil && opts.Spoof {
 		spoof := opts.SpoofAgents
 		if len(spoof) == 0 {
 			spoof = DefaultSpoofAgents()
 		}
-		ladder = append(ladder, spoof...)
+		for _, a := range spoof {
+			attempts = append(attempts, attempt{client: client, agent: a})
+		}
 	}
 
 	var last response
 	var lastErr error
-	for _, a := range ladder {
-		resp, err := get(ctx, client, opts, rawURL, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", a)
+	for _, at := range attempts {
+		resp, err := get(ctx, at.client, opts, rawURL, htmlAccept, at.agent)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, ErrBlockedAddress) {
 				return "", err
@@ -170,8 +218,7 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 	}
 	if last.status < 200 || last.status >= 300 {
 		return "", fmt.Errorf("HTTP %d", last.status)
-	}
-	// Every identity hit a wall that still returned 2xx; hand over what we have.
+	} // Every identity hit a wall that still returned 2xx; hand over what we have.
 	return render(rawURL, last, opts)
 }
 

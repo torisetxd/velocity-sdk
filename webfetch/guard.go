@@ -29,9 +29,13 @@ var cgnat = func() *net.IPNet {
 // addresses. The check runs on the resolved IP at dial time, so it also covers
 // redirects and DNS rebinding. Use it when the URL comes from a model or user
 // and the process can reach internal services.
-func NewSafeClient(timeout time.Duration) *http.Client {
-	dialer := &net.Dialer{
-		Timeout: 15 * time.Second,
+// newGuardDialer returns a dialer that refuses to connect to non-public
+// addresses. The check runs at dial time, so it covers redirects and DNS
+// rebinding, and both the stdlib and the impersonating transports dial through
+// it.
+func newGuardDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout: timeout,
 		Control: func(_, address string, _ syscall.RawConn) error {
 			host, _, err := net.SplitHostPort(address)
 			if err != nil {
@@ -44,6 +48,10 @@ func NewSafeClient(timeout time.Duration) *http.Client {
 			return nil
 		},
 	}
+}
+
+func NewSafeClient(timeout time.Duration) *http.Client {
+	dialer := newGuardDialer(15 * time.Second)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
