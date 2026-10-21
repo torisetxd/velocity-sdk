@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"time"
@@ -57,10 +58,21 @@ type Options struct {
 }
 
 func (o Options) client() *http.Client {
-	if o.Client != nil {
+	if o.Client == nil {
+		jar, _ := cookiejar.New(nil)
+		return &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	}
+	if o.Client.Jar != nil {
 		return o.Client
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	// Challenge walls (Cloudflare's __cf_bm, cf_clearance, ...) hand out their
+	// clearance cookie on the first, refused response and only let the request
+	// that echoes it through, so the jar has to survive across the agents in the
+	// ladder. The caller's client is copied to keep this jar per-fetch.
+	copied := *o.Client
+	jar, _ := cookiejar.New(nil)
+	copied.Jar = jar
+	return &copied
 }
 
 func (o Options) maxBody() int {
@@ -102,6 +114,7 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 		return "", errors.New("url must be an absolute http(s) URL")
 	}
 	agent := opts.baseAgent()
+	client := opts.client()
 
 	if !opts.SkipMarkdownProbes {
 		trimmed := strings.TrimSuffix(rawURL, "/")
@@ -110,7 +123,7 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 			{trimmed + ".mdx", "text/markdown"},
 			{rawURL, "text/markdown"},
 		} {
-			resp, err := get(ctx, opts, probe.url, probe.accept, agent)
+			resp, err := get(ctx, client, opts, probe.url, probe.accept, agent)
 			if err != nil || resp.status < 200 || resp.status >= 300 || strings.TrimSpace(resp.body) == "" {
 				continue
 			}
@@ -136,7 +149,7 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 	var last response
 	var lastErr error
 	for _, a := range ladder {
-		resp, err := get(ctx, opts, rawURL, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", a)
+		resp, err := get(ctx, client, opts, rawURL, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", a)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, ErrBlockedAddress) {
 				return "", err
@@ -173,7 +186,7 @@ func render(source string, resp response, opts Options) (string, error) {
 	return finalize(source, md, resp.cut, opts), nil
 }
 
-func get(ctx context.Context, opts Options, target, accept string, agent Agent) (response, error) {
+func get(ctx context.Context, client *http.Client, opts Options, target, accept string, agent Agent) (response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return response{}, err
@@ -183,7 +196,7 @@ func get(ctx context.Context, opts Options, target, accept string, agent Agent) 
 	for k, v := range agent.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := opts.client().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return response{}, err
 	}
