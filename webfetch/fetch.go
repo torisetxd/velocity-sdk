@@ -4,7 +4,9 @@
 // a short notice, and can retry as a crawler (Googlebot, GPTBot, ...) when a
 // site serves a bot wall to the default client. Challenge walls score the TLS
 // handshake rather than the user agent, so it can also replay the request over
-// a real browser's TLS and HTTP/2 fingerprint (see ImpersonateClient).
+// a real browser's TLS and HTTP/2 fingerprint (see ImpersonateClient). A
+// JavaScript interstitial is cleared by running its inline scripts in an
+// embedded engine over a minimal DOM and following the navigation they make.
 package webfetch
 
 import (
@@ -128,9 +130,61 @@ func (o Options) impersonationAgent() Agent {
 }
 
 type response struct {
-	status int
-	body   string
-	cut    bool
+	status  int
+	body    string
+	cut     bool
+	cookies []*http.Cookie
+}
+
+// maxInterstitialRounds bounds how many pages in a row may navigate before
+// the chain is treated as a wall, and maxInterstitialWait caps how long a
+// timer-delayed navigation is honoured in real time (some walls check that
+// the delay they asked for actually elapsed).
+const (
+	maxInterstitialRounds = 3
+	maxInterstitialWait   = 5 * time.Second
+)
+
+// passInterstitials runs a thin or blocked page's scripts and follows the
+// navigation they make, with the client and identity that drew the page,
+// until a page stops navigating. stuck reports a chain that never settled
+// or whose next hop failed, which the caller treats as blocked.
+func passInterstitials(ctx context.Context, client *http.Client, opts Options, target string, agent Agent, resp response) (response, bool) {
+	var written []*http.Cookie
+	for round := 0; ; round++ {
+		doc, ok := scriptedPage(resp.status, resp.body)
+		if !ok {
+			return resp, false
+		}
+		visible := append([]*http.Cookie(nil), written...)
+		for _, c := range resp.cookies {
+			if !c.HttpOnly {
+				visible = upsertCookie(visible, c, false)
+			}
+		}
+		nav, ok := runPage(target, doc, agent.UserAgent, visible)
+		if !ok {
+			return resp, false
+		}
+		if round == maxInterstitialRounds {
+			return resp, true
+		}
+		if wait := min(nav.delay, maxInterstitialWait); wait > 0 {
+			select {
+			case <-ctx.Done():
+				return resp, true
+			case <-time.After(wait):
+			}
+		}
+		for _, c := range nav.cookies {
+			written = upsertCookie(written, c, false)
+		}
+		next, err := send(ctx, client, opts, nav.method, nav.url, nav.body, htmlAccept, agent, written)
+		if err != nil {
+			return resp, true
+		}
+		target, resp = nav.url, next
+	}
 }
 
 // Fetch returns the page at rawURL as markdown preceded by a source header.
@@ -216,11 +270,13 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 			}
 			continue
 		}
+		resp, stuck := passInterstitials(ctx, at.client, opts, rawURL, at.agent, resp)
 		last, lastErr = resp, nil
-		if resp.status >= 200 && resp.status < 300 && !blocked(resp.status, resp.body) {
+		walled := stuck || blocked(resp.status, resp.body)
+		if resp.status >= 200 && resp.status < 300 && !walled {
 			return render(rawURL, resp, opts)
 		}
-		if !blocked(resp.status, resp.body) {
+		if !walled {
 			break
 		}
 	}
@@ -245,7 +301,19 @@ func render(source string, resp response, opts Options) (string, error) {
 }
 
 func get(ctx context.Context, client *http.Client, opts Options, target, accept string, agent Agent) (response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	return send(ctx, client, opts, http.MethodGet, target, "", accept, agent, nil)
+}
+
+// send performs one request. A non-empty form is sent as a urlencoded body,
+// and cookies (ones a page's scripts set) go to the client's jar when it has
+// one, or on the request otherwise, since the impersonating client keeps its
+// jar out of reach.
+func send(ctx context.Context, client *http.Client, opts Options, method, target, form, accept string, agent Agent, cookies []*http.Cookie) (response, error) {
+	var body io.Reader
+	if form != "" {
+		body = strings.NewReader(form)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return response{}, err
 	}
@@ -253,6 +321,18 @@ func get(ctx context.Context, client *http.Client, opts Options, target, accept 
 	req.Header.Set("User-Agent", agent.UserAgent)
 	for k, v := range agent.Headers {
 		req.Header.Set(k, v)
+	}
+	if form != "" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if len(cookies) > 0 {
+		if client.Jar != nil {
+			client.Jar.SetCookies(req.URL, cookies)
+		} else {
+			for _, c := range cookies {
+				req.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
+			}
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -268,7 +348,7 @@ func get(ctx context.Context, client *http.Client, opts Options, target, accept 
 	if cut {
 		data = data[:limit]
 	}
-	return response{status: resp.StatusCode, body: string(data), cut: cut}, nil
+	return response{status: resp.StatusCode, body: string(data), cut: cut, cookies: resp.Cookies()}, nil
 }
 
 // finalize is the single exit point for fetched content: binary payloads
