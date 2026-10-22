@@ -1,10 +1,144 @@
-// Engine-level polyfills that run before the DOM prelude. Intl is missing
-// from the engine and stood in for in English only: apps format dates,
-// numbers and relative times while rendering, and the output here only needs
-// to read naturally.
+// Engine-level polyfills that run before the DOM prelude: weak collections
+// that stay fast with thousands of keys, and an English-only Intl.
 (function (g) {
   "use strict";
+  // goja backs WeakMap with Go weak pointers, and every lookup registers or
+  // finds one in a per-span list, so a framework that keys reactive state by
+  // object (Ember, MobX, Vue) slows to a crawl. A page lives for seconds and
+  // is then discarded whole, so these hold their keys strongly in a Map
+  // instead: identity lookups that never touch the key, which matters
+  // because keys are often proxies whose traps must not fire.
+  function holdable(key) { return (typeof key === "object" && key !== null) || typeof key === "function"; }
+  function WeakMap(entries) {
+    if (!(this instanceof WeakMap)) throw new TypeError("Constructor WeakMap requires 'new'");
+    Object.defineProperty(this, "__map", { value: new Map() });
+    if (entries) for (var e of entries) this.set(e[0], e[1]);
+  }
+  WeakMap.prototype.get = function (key) { return this.__map.get(key); };
+  WeakMap.prototype.has = function (key) { return this.__map.has(key); };
+  WeakMap.prototype.set = function (key, value) {
+    if (!holdable(key)) throw new TypeError("Invalid value used as weak map key");
+    this.__map.set(key, value);
+    return this;
+  };
+  WeakMap.prototype["delete"] = function (key) { return this.__map["delete"](key); };
+  Object.defineProperty(WeakMap.prototype, Symbol.toStringTag, { value: "WeakMap" });
+  function WeakSet(values) {
+    if (!(this instanceof WeakSet)) throw new TypeError("Constructor WeakSet requires 'new'");
+    Object.defineProperty(this, "__map", { value: new WeakMap() });
+    if (values) for (var v of values) this.add(v);
+  }
+  WeakSet.prototype.add = function (v) {
+    if (!holdable(v)) throw new TypeError("Invalid value used in weak set");
+    this.__map.set(v, true);
+    return this;
+  };
+  WeakSet.prototype.has = function (v) { return this.__map.has(v); };
+  WeakSet.prototype["delete"] = function (v) { return this.__map["delete"](v); };
+  Object.defineProperty(WeakSet.prototype, Symbol.toStringTag, { value: "WeakSet" });
+  Object.defineProperty(g, "WeakMap", { value: WeakMap, writable: true, configurable: true });
+  Object.defineProperty(g, "WeakSet", { value: WeakSet, writable: true, configurable: true });
+  if (typeof g.WeakRef !== "function") {
+    var WeakRef = function (target) { this.__target = target; };
+    WeakRef.prototype.deref = function () { return this.__target; };
+    Object.defineProperty(g, "WeakRef", { value: WeakRef, writable: true, configurable: true });
+  }
+  if (typeof g.FinalizationRegistry !== "function") {
+    var FinalizationRegistry = function () {};
+    FinalizationRegistry.prototype.register = function () {};
+    FinalizationRegistry.prototype.unregister = function () { return false; };
+    Object.defineProperty(g, "FinalizationRegistry", { value: FinalizationRegistry, writable: true, configurable: true });
+  }
+
+  // goja sorts with Go's sort.Stable, which on input already ordered the
+  // other way makes ten times the comparisons of V8's TimSort, and apps tuned
+  // on V8 sort the same list once per row they render. This natural merge
+  // sort keeps TimSort's shape: it finds runs (reversing strictly descending
+  // ones), extends short runs by binary insertion and merges neighbours,
+  // skipping merges that are already in order. It is stable, and comparator
+  // calls dominate its cost.
+  function defaultCompare(a, b) {
+    var x = String(a), y = String(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  function reverseRange(a, lo, hi) {
+    for (hi--; lo < hi; lo++, hi--) { var t = a[lo]; a[lo] = a[hi]; a[hi] = t; }
+  }
+  function insertRange(a, lo, sorted, hi, cmp) {
+    for (var i = sorted; i < hi; i++) {
+      var v = a[i], left = lo, right = i;
+      while (left < right) {
+        var mid = (left + right) >>> 1;
+        if (cmp(v, a[mid]) < 0) right = mid; else left = mid + 1;
+      }
+      for (var j = i; j > left; j--) a[j] = a[j - 1];
+      a[left] = v;
+    }
+  }
+  function mergeRanges(a, lo, mid, hi, cmp, tmp) {
+    if (!(cmp(a[mid - 1], a[mid]) > 0)) return;
+    tmp.length = 0;
+    for (var t = lo; t < mid; t++) tmp.push(a[t]);
+    var i = 0, j = mid, k = lo, n = tmp.length;
+    while (i < n && j < hi) a[k++] = cmp(a[j], tmp[i]) < 0 ? a[j++] : tmp[i++];
+    while (i < n) a[k++] = tmp[i++];
+  }
+  function sortValues(a, cmp) {
+    var n = a.length, bounds = [], i = 0;
+    while (i < n) {
+      var start = i++;
+      if (i < n) {
+        if (cmp(a[i - 1], a[i]) > 0) {
+          while (i < n && cmp(a[i - 1], a[i]) > 0) i++;
+          reverseRange(a, start, i);
+        } else {
+          while (i < n && !(cmp(a[i - 1], a[i]) > 0)) i++;
+        }
+      }
+      var end = Math.min(n, start + 32);
+      if (i < end) { insertRange(a, start, i, end, cmp); i = end; }
+      bounds.push(start);
+    }
+    bounds.push(n);
+    var tmp = [];
+    while (bounds.length > 2) {
+      var next = [];
+      for (var k = 0; k < bounds.length - 1; k += 2) {
+        next.push(bounds[k]);
+        if (k + 2 < bounds.length) mergeRanges(a, bounds[k], bounds[k + 1], bounds[k + 2], cmp, tmp);
+      }
+      next.push(n);
+      bounds = next;
+    }
+  }
+  Object.defineProperty(Array.prototype, "sort", {
+    value: function sort(compare) {
+      if (compare !== undefined && typeof compare !== "function") {
+        throw new TypeError("The comparison function must be either a function or undefined");
+      }
+      var o = Object(this);
+      var len = o.length >>> 0;
+      if (len < 2) return o;
+      var values = [], undefs = 0;
+      for (var i = 0; i < len; i++) {
+        if (!(i in o)) continue;
+        var v = o[i];
+        if (v === undefined) undefs++; else values.push(v);
+      }
+      sortValues(values, compare || defaultCompare);
+      var k = 0;
+      for (; k < values.length; k++) o[k] = values[k];
+      for (var u = 0; u < undefs; u++) o[k++] = undefined;
+      for (; k < len; k++) delete o[k];
+      return o;
+    },
+    writable: true,
+    configurable: true
+  });
+
   if (g.Intl) return;
+  // Intl is English only: apps format dates, numbers and relative times while
+  // rendering, and the output here only needs to read naturally.
 
   var months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
   var days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
