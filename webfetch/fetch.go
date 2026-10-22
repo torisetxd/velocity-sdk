@@ -423,11 +423,24 @@ func isBinaryContent(content string) bool {
 // looksLikeHTML catches servers that ignore Accept and answer a markdown probe
 // with the HTML page, which should go through the HTML cleaner instead.
 func looksLikeHTML(s string) bool {
-	head := strings.ToLower(strings.TrimSpace(s))
-	if len(head) > 512 {
-		head = head[:512]
+	head := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(s, "\xef\xbb\xbf")))
+	if len(head) > 4096 {
+		head = head[:4096]
 	}
-	return strings.HasPrefix(head, "<!doctype html") || strings.HasPrefix(head, "<html")
+	// Static bundles often open with a build comment before the doctype.
+	for strings.HasPrefix(head, "<!--") {
+		end := strings.Index(head, "-->")
+		if end < 0 {
+			break
+		}
+		head = strings.TrimSpace(head[end+3:])
+	}
+	for _, prefix := range []string{"<!doctype html", "<html", "<head", "<body"} {
+		if strings.HasPrefix(head, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains404(s string) bool {
