@@ -75,6 +75,24 @@ type Options struct {
 	// refusal to dial (a private address, which the impersonating client guards
 	// against) never masks the ladder's own result.
 	ImpersonateOnBlock bool
+	// RenderApps runs a client-rendered page (an app shell with next to no
+	// text of its own) the way a browser would, without one: its scripts and
+	// modules load and execute in an embedded JS engine over a minimal DOM,
+	// fetch and XHR go out over this fetch's client, and the DOM it settles on
+	// is converted instead. It is tried after looking for the data document
+	// the app loads, and costs the app's bundle download and seconds of CPU.
+	RenderApps bool
+	// RenderTimeout bounds one RenderApps render, scripts and requests
+	// included; zero means DefaultRenderTimeout. A render that runs out
+	// returns whatever the page had drawn by then, if anything.
+	RenderTimeout time.Duration
+}
+
+func (o Options) renderTimeout() time.Duration {
+	if o.RenderTimeout > 0 {
+		return o.RenderTimeout
+	}
+	return DefaultRenderTimeout
 }
 
 func (o Options) client() *http.Client {
@@ -273,10 +291,20 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 		resp, stuck := passInterstitials(ctx, at.client, opts, rawURL, at.agent, resp)
 		last, lastErr = resp, nil
 		walled := stuck || blocked(resp.status, resp.body)
-		if resp.status >= 200 && resp.status < 300 && !walled {
+		// An app shell's <noscript> fallback ("enable JavaScript to run this
+		// app") reads as a wall, but running the app is exactly what clears it,
+		// so client rendering gets the first look at any 2xx page.
+		if resp.status >= 200 && resp.status < 300 && !stuck {
 			if out, ok := appShellData(ctx, at.client, opts, rawURL, at.agent, resp); ok {
 				return out, nil
 			}
+			if opts.RenderApps {
+				if rendered, ok := renderApp(ctx, at.client, opts, rawURL, at.agent, resp); ok {
+					return render(rawURL, rendered, opts)
+				}
+			}
+		}
+		if resp.status >= 200 && resp.status < 300 && !walled {
 			return render(rawURL, resp, opts)
 		}
 		if !walled {

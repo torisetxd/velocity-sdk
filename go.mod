@@ -7,6 +7,7 @@ require (
 	github.com/bogdanfinn/fhttp v0.6.9
 	github.com/bogdanfinn/tls-client v1.16.0
 	github.com/dop251/goja v0.0.0-20261022125820-07c4b9d6265b
+	github.com/evanw/esbuild v0.28.0
 	github.com/google/uuid v1.6.0
 	github.com/tiktoken-go/tokenizer v0.8.1
 	golang.org/x/net v0.61.0

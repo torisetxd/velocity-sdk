@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash"
 	"net/http"
 	"net/url"
@@ -21,10 +22,15 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
-//go:embed dom.js
-var domPrelude string
+var (
+	//go:embed dom.js
+	domPrelude string
+	//go:embed engine.js
+	enginePrelude string
 
-var domProgram = goja.MustCompile("dom.js", domPrelude, false)
+	domProgram    = goja.MustCompile("dom.js", domPrelude, false)
+	engineProgram = goja.MustCompile("engine.js", enginePrelude, false)
+)
 
 const (
 	// maxScriptedPage bounds which responses are run as scripts at all:
@@ -35,13 +41,17 @@ const (
 	thinPageText = 1500
 	// scriptBudget is the wall-clock time a page's scripts get, timers included.
 	scriptBudget   = 3 * time.Second
-	maxScriptTicks = 256
+	maxScriptTicks = 512
+	maxReports     = 64
 	// maxRefreshDelay is the longest meta refresh still followed; longer ones are
 	// pages that poll for updates, not interstitials.
 	maxRefreshDelay = 10 * time.Second
 )
 
-var errNavigated = errors.New("navigated")
+var (
+	errNavigated = errors.New("navigated")
+	errBudget    = errors.New("script budget exhausted")
+)
 
 // navigation is the request a page's scripts (or meta refresh) asked for.
 type navigation struct {
@@ -100,87 +110,25 @@ func visibleText(n *html.Node, limit int) int {
 
 // runPage executes doc's inline scripts in a sandboxed JS engine over a
 // minimal DOM, then its DOMContentLoaded and load handlers and its timers on a
-// virtual clock, and reports the first navigation the page attempts. There is
-// no network access, so external scripts, fetch and XHR are unavailable; this
-// clears interstitials that compute an answer and submit a form, set a cookie
-// and reload, or redirect, not ones that need a real rendering engine.
-func runPage(target string, doc *html.Node, userAgent string, cookies []*http.Cookie) (navigation, bool) {
+// virtual clock, and reports the first navigation the page attempts. It is
+// offline: external scripts, fetch and XHR are unavailable, so this clears
+// interstitials that compute an answer and submit a form, set a cookie and
+// reload, or redirect (see renderApp for pages that need the network).
+func runPage(target string, doc *html.Node, userAgent string, cookies []*http.Cookie) (nav navigation, ok bool) {
+	defer func() {
+		if recover() != nil {
+			nav, ok = navigation{}, false
+		}
+	}()
 	page, err := url.Parse(target)
 	if err != nil {
 		return navigation{}, false
 	}
-	root := documentElement(doc)
-	if root == nil {
+	s := &pageSession{page: page, cookies: append([]*http.Cookie(nil), cookies...)}
+	if !s.start(doc, target, userAgent) {
 		return navigation{}, false
 	}
-	tree, err := json.Marshal(jsTree(root))
-	if err != nil {
-		return navigation{}, false
-	}
-
-	vm := goja.New()
-	s := &pageSession{vm: vm, page: page, cookies: append([]*http.Cookie(nil), cookies...)}
-	vm.Set("__host", s.host())
-	vm.Set("__tree", string(tree))
-	vm.Set("__url", target)
-	vm.Set("__ua", userAgent)
-	budget := time.AfterFunc(scriptBudget, func() { vm.Interrupt(errors.New("script budget exhausted")) })
-	defer budget.Stop()
-
-	if _, err := vm.RunProgram(domProgram); err != nil {
-		return navigation{}, false
-	}
-	hooks := vm.Get("__page").ToObject(vm)
-	call := func(name string, args ...any) (goja.Value, bool) {
-		fn, ok := goja.AssertFunction(hooks.Get(name))
-		if !ok {
-			return nil, false
-		}
-		values := make([]goja.Value, len(args))
-		for i, a := range args {
-			values[i] = vm.ToValue(a)
-		}
-		v, err := fn(goja.Undefined(), values...)
-		var interrupted *goja.InterruptedError
-		if errors.As(err, &interrupted) {
-			return nil, false
-		}
-		if err != nil {
-			return goja.Undefined(), true
-		}
-		return v, true
-	}
-
-	var scripts []string
-	if err := vm.ExportTo(hooks.Get("scripts"), &scripts); err != nil {
-		return navigation{}, false
-	}
-	running := true
-	for i, code := range scripts {
-		if !running || s.nav != nil {
-			break
-		}
-		call("enter", i)
-		_, err := vm.RunScript("inline-"+strconv.Itoa(i)+".js", code)
-		var interrupted *goja.InterruptedError
-		if errors.As(err, &interrupted) {
-			running = false
-			break
-		}
-		_, running = call("leave")
-	}
-	for _, phase := range []string{"DOMContentLoaded", "load"} {
-		if running && s.nav == nil {
-			_, running = call("fire", phase)
-		}
-	}
-	for i := 0; i < maxScriptTicks && running && s.nav == nil; i++ {
-		more, ok := call("tick")
-		if !ok || !more.ToBoolean() {
-			break
-		}
-	}
-
+	s.settle(scriptBudget, maxScriptTicks)
 	if s.nav == nil {
 		if nav, ok := metaRefresh(doc, page); ok {
 			s.nav = &nav
@@ -193,6 +141,124 @@ func runPage(target string, doc *html.Node, userAgent string, cookies []*http.Co
 	return *s.nav, true
 }
 
+// start loads doc into a fresh engine with the DOM prelude.
+func (s *pageSession) start(doc *html.Node, target, userAgent string) bool {
+	root := documentElement(doc)
+	if root == nil {
+		return false
+	}
+	tree, err := json.Marshal(jsTree(root))
+	if err != nil {
+		return false
+	}
+	s.vm = goja.New()
+	s.vm.SetPromiseRejectionTracker(s.trackRejection)
+	s.vm.Set("__host", s.host())
+	s.vm.Set("__tree", string(tree))
+	s.vm.Set("__url", target)
+	s.vm.Set("__ua", userAgent)
+	if _, err := s.vm.RunProgram(engineProgram); err != nil {
+		return false
+	}
+	if _, err := s.vm.RunProgram(domProgram); err != nil {
+		return false
+	}
+	s.hooks = s.vm.Get("__page").ToObject(s.vm)
+	return true
+}
+
+// settle boots the page and pumps its event loop until it goes idle,
+// navigates, or runs out of time or steps.
+func (s *pageSession) settle(budget time.Duration, steps int) {
+	timer := time.AfterFunc(budget, func() { s.vm.Interrupt(errBudget) })
+	defer timer.Stop()
+	if _, ok := s.call("boot"); !ok {
+		return
+	}
+	for i := 0; i < steps && s.nav == nil; i++ {
+		more, ok := s.call("pump")
+		if !ok || !more.ToBoolean() {
+			return
+		}
+	}
+}
+
+// call invokes a __page hook; ok is false once the engine was interrupted.
+func (s *pageSession) call(name string) (goja.Value, bool) {
+	fn, ok := goja.AssertFunction(s.hooks.Get(name))
+	if !ok {
+		return nil, false
+	}
+	v, err := fn(goja.Undefined())
+	var interrupted *goja.InterruptedError
+	if errors.As(err, &interrupted) {
+		return nil, false
+	}
+	if err != nil {
+		s.report(err.Error())
+		return goja.Undefined(), true
+	}
+	return v, true
+}
+
+// runScript runs a classic script at global scope, lowered to syntax the
+// engine supports when esbuild can parse it.
+func (s *pageSession) runScript(code, name string) (ran bool) {
+	defer s.recoverEngine(name, func() { ran = false })
+	if lowered, err := transformJS(code, name, false); err == nil {
+		code = lowered
+	}
+	_, err := s.vm.RunScript(name, code)
+	return s.nested(err)
+}
+
+// nested handles the error of a script run from inside a host call: an
+// interrupt is re-raised so the outer run stops too, anything else is a
+// script error the page carries on from.
+func (s *pageSession) nested(err error) bool {
+	if err == nil {
+		return true
+	}
+	var interrupted *goja.InterruptedError
+	if errors.As(err, &interrupted) {
+		s.vm.Interrupt(interrupted.Value())
+		return false
+	}
+	s.report(err.Error())
+	return false
+}
+
+// trackRejection reports promise rejections nothing handled, which is how
+// most framework render failures surface.
+func (s *pageSession) trackRejection(p *goja.Promise, op goja.PromiseRejectionOperation) {
+	if op != goja.PromiseRejectionReject {
+		return
+	}
+	reason := p.Result()
+	if o, ok := reason.(*goja.Object); ok {
+		if stack := o.Get("stack"); stack != nil && !goja.IsUndefined(stack) {
+			s.report("unhandled rejection: " + stack.String())
+			return
+		}
+	}
+	s.report(fmt.Sprintf("unhandled rejection: %v", reason))
+}
+
+// recoverEngine turns a panic out of the engine's parser (goja has a few on
+// unusual literals) into a failed script instead of a crashed fetch.
+func (s *pageSession) recoverEngine(name string, failed func()) {
+	if r := recover(); r != nil {
+		s.report(fmt.Sprintf("%s: engine panic: %v", name, r))
+		failed()
+	}
+}
+
+func (s *pageSession) report(message string) {
+	if len(s.reports) < maxReports {
+		s.reports = append(s.reports, message)
+	}
+}
+
 func documentElement(doc *html.Node) *html.Node {
 	for c := doc.FirstChild; c != nil; c = c.NextSibling {
 		if c.Type == html.ElementNode {
@@ -203,10 +269,14 @@ func documentElement(doc *html.Node) *html.Node {
 }
 
 // jsTree is the shape dom.js builds its document from: an element is
-// {t, a, c} and a text node is a bare string.
+// {t, a, c} plus n for a foreign namespace, a comment is {x}, and a text node
+// is a bare string.
 func jsTree(n *html.Node) any {
-	if n.Type == html.TextNode {
+	switch n.Type {
+	case html.TextNode:
 		return n.Data
+	case html.CommentNode:
+		return map[string]any{"x": n.Data}
 	}
 	attrs := make([][2]string, 0, len(n.Attr))
 	for _, a := range n.Attr {
@@ -214,11 +284,15 @@ func jsTree(n *html.Node) any {
 	}
 	children := []any{}
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		if c.Type == html.ElementNode || c.Type == html.TextNode {
+		if c.Type == html.ElementNode || c.Type == html.TextNode || c.Type == html.CommentNode {
 			children = append(children, jsTree(c))
 		}
 	}
-	return map[string]any{"t": n.Data, "a": attrs, "c": children}
+	node := map[string]any{"t": n.Data, "a": attrs, "c": children}
+	if n.Namespace != "" {
+		node["n"] = n.Namespace
+	}
+	return node
 }
 
 func metaRefresh(doc *html.Node, page *url.URL) (navigation, bool) {
@@ -279,14 +353,18 @@ func htmlAttr(n *html.Node, key string) string {
 // primitives it lacks.
 type pageSession struct {
 	vm      *goja.Runtime
+	hooks   *goja.Object
 	page    *url.URL
 	nav     *navigation
 	cookies []*http.Cookie
 	written []*http.Cookie
+	reports []string
+	// net is set when the page may reach the network (render mode).
+	net *pageNetwork
 }
 
 func (s *pageSession) host() map[string]any {
-	return map[string]any{
+	host := map[string]any{
 		"navigate":      s.navigate,
 		"resolve":       s.resolve,
 		"parseURL":      s.parseURL,
@@ -294,12 +372,22 @@ func (s *pageSession) host() map[string]any {
 		"getCookie":     s.getCookie,
 		"setCookie":     s.setCookie,
 		"parseFragment": parseFragmentJSON,
+		"parseDocument": parseDocumentJSON,
 		"atob":          s.atob,
 		"btoa":          s.btoa,
 		"utf8Encode":    func(text string) goja.ArrayBuffer { return s.vm.NewArrayBuffer([]byte(text)) },
 		"utf8Decode":    func(data goja.Value) string { return string(exportBytes(data)) },
 		"digest":        s.digest,
+		"runScript":     s.runScript,
+		"report":        s.report,
 	}
+	if s.net != nil {
+		host["request"] = s.request
+		host["loadScript"] = s.loadScript
+		host["loadModule"] = s.loadModule
+		host["compileModule"] = s.compileModule
+	}
+	return host
 }
 
 func (s *pageSession) navigate(method, target, pairsJSON string, clock float64, reload bool) {
@@ -429,6 +517,8 @@ func (s *pageSession) withPart(href, part, value string) string {
 		}
 	case "search":
 		u.RawQuery = strings.TrimPrefix(value, "?")
+	case "hash":
+		u.Fragment = strings.TrimPrefix(value, "#")
 	}
 	return u.String()
 }
@@ -530,6 +620,18 @@ func exportBytes(v goja.Value) []byte {
 	return nil
 }
 
+func parseDocumentJSON(markup string) string {
+	doc, err := html.Parse(strings.NewReader(markup))
+	if err != nil {
+		return `{"t":"html","a":[],"c":[]}`
+	}
+	data, err := json.Marshal(jsTree(documentElement(doc)))
+	if err != nil {
+		return `{"t":"html","a":[],"c":[]}`
+	}
+	return string(data)
+}
+
 func parseFragmentJSON(markup string) string {
 	body := &html.Node{Type: html.ElementNode, Data: "body", DataAtom: atom.Body}
 	nodes, err := html.ParseFragment(strings.NewReader(markup), body)
@@ -538,7 +640,7 @@ func parseFragmentJSON(markup string) string {
 	}
 	out := make([]any, 0, len(nodes))
 	for _, n := range nodes {
-		if n.Type == html.ElementNode || n.Type == html.TextNode {
+		if n.Type == html.ElementNode || n.Type == html.TextNode || n.Type == html.CommentNode {
 			out = append(out, jsTree(n))
 		}
 	}
