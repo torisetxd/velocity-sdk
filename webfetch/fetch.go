@@ -274,6 +274,9 @@ func Fetch(ctx context.Context, rawURL string, opts Options) (string, error) {
 		last, lastErr = resp, nil
 		walled := stuck || blocked(resp.status, resp.body)
 		if resp.status >= 200 && resp.status < 300 && !walled {
+			if out, ok := appShellData(ctx, at.client, opts, rawURL, at.agent, resp); ok {
+				return out, nil
+			}
 			return render(rawURL, resp, opts)
 		}
 		if !walled {
