@@ -91,6 +91,7 @@ func pruneHTMLBoilerplate(root *html.Node) {
 		return
 	}
 
+	protected := contentPath(root)
 	stack := []*html.Node{root}
 	for len(stack) > 0 {
 		last := len(stack) - 1
@@ -99,7 +100,7 @@ func pruneHTMLBoilerplate(root *html.Node) {
 
 		for n := parent.FirstChild; n != nil; {
 			next := n.NextSibling
-			if shouldRemoveNode(n) {
+			if !protected[n] && shouldRemoveNode(n) {
 				removeNode(n)
 			} else {
 				stack = append(stack, n)
@@ -107,6 +108,65 @@ func pruneHTMLBoilerplate(root *html.Node) {
 			n = next
 		}
 	}
+}
+
+// contentPath marks the page's primary content (main, article, role=main and
+// h1 headings) and every ancestor of it. Marker matching is heuristic, and a
+// layout wrapper whose class mentions a sidebar, or a page-wide ASP.NET form,
+// must not take the content down with it.
+func contentPath(root *html.Node) map[*html.Node]bool {
+	protected := map[*html.Node]bool{}
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && isPrimaryContent(n) {
+			for p := n; p != nil && !protected[p]; p = p.Parent {
+				protected[p] = true
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return protected
+}
+
+func isPrimaryContent(n *html.Node) bool {
+	switch n.DataAtom {
+	case atom.Main, atom.Article, atom.H1:
+		return true
+	}
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, "role") && strings.EqualFold(strings.TrimSpace(a.Val), "main") {
+			return true
+		}
+	}
+	return false
+}
+
+// semanticClasses drops utility-CSS tokens from a class list before marker
+// matching: variants and arbitrary values (xs:block, [&.fixed-sidebar]:...),
+// overflow-hidden and friends, and a bare "hidden" that a responsive variant
+// shows again. Otherwise every Tailwind page reads as hidden boilerplate.
+func semanticClasses(class string) string {
+	tokens := strings.Fields(class)
+	shownAgain := false
+	for _, t := range tokens {
+		if i := strings.LastIndexByte(t, ':'); i >= 0 {
+			switch t[i+1:] {
+			case "block", "flex", "grid", "inline", "inline-block", "inline-flex", "inline-grid", "contents", "table", "visible":
+				shownAgain = true
+			}
+		}
+	}
+	kept := tokens[:0]
+	for _, t := range tokens {
+		if strings.ContainsAny(t, ":[(") || strings.HasPrefix(t, "overflow-") || (t == "hidden" && shownAgain) {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return strings.Join(kept, " ")
 }
 
 func shouldRemoveNode(n *html.Node) bool {
@@ -134,6 +194,7 @@ func shouldRemoveNode(n *html.Node) bool {
 		seen[idx] = true
 		attrs[idx] = attr.Val
 	}
+	attrs[1] = semanticClasses(attrs[1])
 
 	for _, value := range attrs {
 		if value == "" {
