@@ -23,6 +23,7 @@ func NewKimiProvider(apiURL, apiKey string, extraBody map[string]any, reasoningF
 		reasoningField = "reasoning_content"
 	}
 	inner := NewOpenAICompatibleProvider(apiURL, apiKey, extraBody, reasoningField)
+	inner.emptyToolCallReasoning = true
 	return &kimiProvider{inner: inner}
 }
 

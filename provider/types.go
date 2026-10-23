@@ -170,6 +170,10 @@ func ConvertMessagesWithOptions(messages []ChatMessage, opts ConvertMessageOptio
 			for _, field := range reasoning.TextFields {
 				chatMsg[field] = msg.Reasoning
 			}
+		} else if role == "assistant" && reasoning.IncludeEmptyOnToolCalls && len(msg.ToolCalls) > 0 {
+			for _, field := range reasoning.TextFields {
+				chatMsg[field] = ""
+			}
 		}
 
 		converted = append(converted, chatMsg)

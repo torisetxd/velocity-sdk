@@ -19,6 +19,7 @@ type openAICompatibleProvider struct {
 	reasoningField         string
 	extraHeaders           map[string]string
 	toolResultImagesAsUser bool
+	emptyToolCallReasoning bool
 }
 
 func NewOpenAICompatibleProvider(apiURL, apiKey string, extraBody map[string]any, reasoningField string) *openAICompatibleProvider {
@@ -66,6 +67,7 @@ func (p *openAICompatibleProvider) StreamChat(ctx context.Context, req ChatReque
 		field = "reasoning_content"
 	}
 	reasoning := OpenAICompatibleReasoningPersistence(field)
+	reasoning.IncludeEmptyOnToolCalls = p.emptyToolCallReasoning
 
 	body, err := BuildOpenAIChatBody(req, OpenAIRequestOptions{
 		ForceStream:            true,

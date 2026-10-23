@@ -22,6 +22,9 @@ type ReasoningPersistence struct {
 	TextFields          []string
 	DetailsField        string
 	IncludeEmptyDetails bool
+	// IncludeEmptyOnToolCalls writes an empty text field on assistant tool-call
+	// messages that carry no reasoning, for APIs that reject them without it.
+	IncludeEmptyOnToolCalls bool
 }
 
 func OpenAICompatibleReasoningPersistence(reasoningField string) ReasoningPersistence {
