@@ -18,6 +18,7 @@ const (
 	TypeCrof             = "crof"
 	TypeZen              = "zen"
 	TypeCline            = "cline"
+	TypeKimi             = "kimi"
 
 	DefaultOpenAICompatibleURL = "http://localhost:8787/chat/completions"
 	DefaultOpenRouterURL       = "https://openrouter.ai/api/v1/chat/completions"
@@ -26,6 +27,7 @@ const (
 	DefaultCrofURL             = "https://crof.ai/v1/chat/completions"
 	DefaultZenURL              = "https://opencode.ai/zen/v1/chat/completions"
 	DefaultClineURL            = "https://api.cline.bot/api/v1/chat/completions"
+	DefaultKimiURL             = "https://api.kimi.com/coding/v1/chat/completions"
 )
 
 var (
@@ -70,6 +72,8 @@ func DetectType(rawType, apiURL string) string {
 		return TypeZen
 	case strings.Contains(lowerURL, "api.cline.bot"):
 		return TypeCline
+	case strings.Contains(lowerURL, "api.kimi.com/coding"), strings.Contains(lowerURL, "api.kimi.ai/coding"):
+		return TypeKimi
 	case strings.HasSuffix(strings.TrimRight(lowerURL, "/"), "/responses"):
 		return TypeResponses
 	default:
@@ -91,6 +95,8 @@ func DefaultURLForType(providerType string) string {
 		return DefaultZenURL
 	case TypeCline:
 		return DefaultClineURL
+	case TypeKimi:
+		return DefaultKimiURL
 	default:
 		return DefaultOpenAICompatibleURL
 	}
@@ -160,6 +166,12 @@ func registerBuiltins(registry *Registry) {
 		}
 		return provider.NewClineProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField), nil
 	})
+	mustRegister(registry, TypeKimi, func(config Config) (Client, error) {
+		if config.APIURL == "" {
+			config.APIURL = DefaultKimiURL
+		}
+		return provider.NewKimiProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField), nil
+	}, "kimi-code")
 }
 
 func mustRegister(registry *Registry, providerType string, factory Factory, aliases ...string) {
