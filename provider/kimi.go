@@ -16,6 +16,8 @@ const defaultKimiAPIURL = "https://api.kimi.com/coding/v1/chat/completions"
 var kimiFallbackModels = []ModelInfo{
 	{ID: "k3", Name: "K3", ContextLength: 1048576},
 	{ID: "k3-256k", Name: "K3 (256K)", ContextLength: 262144},
+	{ID: "k3.1-pro", Name: "K3.1 Pro", ContextLength: 262144},
+	{ID: "k3.1-pro-highspeed", Name: "K3.1 Pro Highspeed", ContextLength: 1048576},
 	{ID: "kimi-for-coding", Name: "K2.8 Preview", ContextLength: 1048576},
 	{ID: "kimi-for-coding-highspeed", Name: "K2.7 Code HighSpeed", ContextLength: 262144},
 }
