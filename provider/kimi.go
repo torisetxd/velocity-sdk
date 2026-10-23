@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -88,6 +89,10 @@ type kimiUsageResponse struct {
 		} `json:"window"`
 		Detail kimiUsageDetail `json:"detail"`
 	} `json:"limits"`
+	Usages map[string]struct {
+		UsedRatio float64 `json:"used_ratio"`
+		ResetTime string  `json:"reset_time"`
+	} `json:"usages"`
 }
 
 func (d kimiUsageDetail) reset(window string) (UsageWindowReset, bool) {
@@ -112,6 +117,18 @@ func (d kimiUsageDetail) reset(window string) (UsageWindowReset, bool) {
 		resetAt = t.Unix()
 	}
 	return UsageWindowReset{Window: window, UsedPercent: percent, ResetAt: resetAt}, true
+}
+
+func kimiPoolLabel(key string) string {
+	switch key = strings.TrimPrefix(key, "limit_"); key {
+	case "5h":
+		return "5h"
+	case "month_total":
+		return "monthly"
+	case "month_code":
+		return "monthly code"
+	}
+	return strings.ReplaceAll(key, "_", " ")
 }
 
 func kimiWindowLabel(duration int64, unit string) string {
@@ -168,6 +185,22 @@ func (p *kimiProvider) FetchUsage(ctx context.Context) (UsageInfo, error) {
 	}
 
 	info := UsageInfo{}
+	if len(raw.Usages) > 0 {
+		keys := make([]string, 0, len(raw.Usages))
+		for key := range raw.Usages {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			pool := raw.Usages[key]
+			window := UsageWindowReset{Window: kimiPoolLabel(key), UsedPercent: int(pool.UsedRatio * 100)}
+			if t, err := time.Parse(time.RFC3339Nano, pool.ResetTime); err == nil {
+				window.ResetAt = t.Unix()
+			}
+			info.Resets = append(info.Resets, window)
+		}
+		return info, nil
+	}
 	for _, limit := range raw.Limits {
 		label := kimiWindowLabel(limit.Window.Duration, limit.Window.TimeUnit)
 		if label == "" {
