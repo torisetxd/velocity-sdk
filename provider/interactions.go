@@ -143,7 +143,8 @@ func (p *interactionsProvider) StreamChat(ctx context.Context, req ChatRequest) 
 	}
 
 	background, _ := payload["background"].(bool)
-	s := newInteractionsStream(ctx, p, background)
+	input, _ := payload["input"].([]map[string]any)
+	s := newInteractionsStream(ctx, p, background, len(input))
 	if err := s.open(http.MethodPost, p.createURL, body); err != nil {
 		return nil, err
 	}

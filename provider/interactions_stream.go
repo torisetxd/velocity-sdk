@@ -170,17 +170,22 @@ type interactionsStream struct {
 	text      replayGate
 	reasoning replayGate
 
+	inputSteps int
+	produced   bool
+	checked    bool
+
 	resumes int
 	pending []StreamEvent
 	done    bool
 }
 
-func newInteractionsStream(ctx context.Context, p *interactionsProvider, background bool) *interactionsStream {
+func newInteractionsStream(ctx context.Context, p *interactionsProvider, background bool, inputSteps int) *interactionsStream {
 	return &interactionsStream{
 		ctx:        ctx,
 		p:          p,
 		streamID:   debugtrace.NextID(),
 		background: background,
+		inputSteps: inputSteps,
 		steps:      map[int]*interactionsStep{},
 	}
 }
@@ -249,9 +254,17 @@ func (s *interactionsStream) Recv() (StreamEvent, error) {
 		payload, err := s.readPayload()
 		if err == nil {
 			if payload == "[DONE]" {
-				s.finish()
-				continue
+				if !isTerminalInteractionStatus(s.status) {
+					err = io.ErrUnexpectedEOF
+				} else if err := s.settle(); err != nil {
+					s.done = true
+					return StreamEvent{}, err
+				} else {
+					continue
+				}
 			}
+		}
+		if err == nil {
 			handleErr := s.handle(payload)
 			if handleErr == nil {
 				continue
@@ -269,7 +282,10 @@ func (s *interactionsStream) Recv() (StreamEvent, error) {
 		}
 		if errors.Is(err, io.EOF) {
 			if isTerminalInteractionStatus(s.status) {
-				s.finish()
+				if err := s.settle(); err != nil {
+					s.done = true
+					return StreamEvent{}, err
+				}
 				continue
 			}
 			err = io.ErrUnexpectedEOF
@@ -310,6 +326,7 @@ func (s *interactionsStream) readPayload() (string, error) {
 }
 
 func (s *interactionsStream) emit(ev StreamEvent) {
+	s.produced = true
 	s.pending = append(s.pending, ev)
 }
 
@@ -352,13 +369,16 @@ func (s *interactionsStream) handle(payload string) error {
 			if ev.Interaction.ID != "" {
 				s.interactionID = ev.Interaction.ID
 			}
+			if !isTerminalInteractionStatus(ev.Interaction.Status) {
+				return &interactionsTransient{err: fmt.Errorf("interaction ended its stream while %q: %w", ev.Interaction.Status, io.ErrUnexpectedEOF)}
+			}
 			s.status = ev.Interaction.Status
 			if ev.Interaction.Usage != nil {
 				s.usage = ev.Interaction.Usage
 			}
 			s.setFailure(ev.Interaction.Errors)
 		}
-		s.finish()
+		return s.settle()
 	case "step.start":
 		s.startStep(ev)
 	case "step.delta":
@@ -509,6 +529,21 @@ func isTerminalInteractionStatus(status string) bool {
 		return true
 	}
 	return false
+}
+
+// settle finishes a turn that reached a final status. A turn that produced
+// nothing is cross-checked against the stored interaction first, because the
+// stream can end before its output was delivered.
+func (s *interactionsStream) settle() error {
+	switch s.status {
+	case "completed", "requires_action", "incomplete":
+		if !s.produced && !s.checked && s.interactionID != "" {
+			s.checked = true
+			return s.poll(io.ErrUnexpectedEOF)
+		}
+	}
+	s.finish()
+	return nil
 }
 
 // finish queues the closing event with usage and the data needed to replay
@@ -679,7 +714,11 @@ func (s *interactionsStream) replayResource(res interactionsResource) {
 	var text strings.Builder
 	var thoughts []map[string]any
 	calls := 0
-	for _, step := range res.Steps {
+	steps := res.Steps
+	if s.inputSteps > 0 && len(steps) >= s.inputSteps && len(steps) > 0 && steps[0].Type == "user_input" {
+		steps = steps[s.inputSteps:]
+	}
+	for _, step := range steps {
 		switch step.Type {
 		case "model_output":
 			for _, part := range step.Content {
@@ -711,6 +750,7 @@ func (s *interactionsStream) replayResource(res interactionsResource) {
 	}
 	s.text.seen = 0
 	if fresh := s.text.take(text.String()); fresh != "" {
+		s.produced = true
 		s.pending = append([]StreamEvent{{Content: fresh}}, s.pending...)
 	}
 	if len(s.thoughts) == 0 {
