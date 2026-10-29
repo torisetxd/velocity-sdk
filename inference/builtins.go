@@ -1,6 +1,7 @@
 package inference
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -19,6 +20,8 @@ const (
 	TypeZen              = "zen"
 	TypeCline            = "cline"
 	TypeKimi             = "kimi"
+	TypeGemini           = "gemini"
+	TypeVertex           = "vertex"
 
 	DefaultOpenAICompatibleURL = "http://localhost:8787/chat/completions"
 	DefaultOpenRouterURL       = "https://openrouter.ai/api/v1/chat/completions"
@@ -28,6 +31,7 @@ const (
 	DefaultZenURL              = "https://opencode.ai/zen/v1/chat/completions"
 	DefaultClineURL            = "https://api.cline.bot/api/v1/chat/completions"
 	DefaultKimiURL             = "https://api.kimi.com/coding/v1/chat/completions"
+	DefaultGeminiURL           = "https://generativelanguage.googleapis.com/v1beta"
 )
 
 var (
@@ -74,6 +78,10 @@ func DetectType(rawType, apiURL string) string {
 		return TypeCline
 	case strings.Contains(lowerURL, "api.kimi.com/coding"), strings.Contains(lowerURL, "api.kimi.ai/coding"):
 		return TypeKimi
+	case strings.Contains(lowerURL, "generativelanguage.googleapis.com"):
+		return TypeGemini
+	case strings.Contains(lowerURL, "aiplatform.googleapis.com"):
+		return TypeVertex
 	case strings.HasSuffix(strings.TrimRight(lowerURL, "/"), "/responses"):
 		return TypeResponses
 	default:
@@ -97,6 +105,8 @@ func DefaultURLForType(providerType string) string {
 		return DefaultClineURL
 	case TypeKimi:
 		return DefaultKimiURL
+	case TypeGemini:
+		return DefaultGeminiURL
 	default:
 		return DefaultOpenAICompatibleURL
 	}
@@ -172,6 +182,27 @@ func registerBuiltins(registry *Registry) {
 		}
 		return provider.NewKimiProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField), nil
 	}, "kimi-code")
+	mustRegister(registry, TypeGemini, func(config Config) (Client, error) {
+		return provider.NewInteractionsProvider(provider.InteractionsConfig{
+			APIURL:      config.APIURL,
+			APIKey:      config.APIKey,
+			ExtraBody:   config.ExtraBody,
+			TokenSource: config.TokenSource,
+		}), nil
+	}, "gemini-interactions", "google")
+	mustRegister(registry, TypeVertex, func(config Config) (Client, error) {
+		if config.Project == "" {
+			return nil, fmt.Errorf("vertex provider requires a project")
+		}
+		return provider.NewInteractionsProvider(provider.InteractionsConfig{
+			APIURL:      config.APIURL,
+			APIKey:      config.APIKey,
+			Project:     config.Project,
+			Location:    config.Location,
+			ExtraBody:   config.ExtraBody,
+			TokenSource: config.TokenSource,
+		}), nil
+	}, "vertex-ai", "vertex-interactions")
 }
 
 func mustRegister(registry *Registry, providerType string, factory Factory, aliases ...string) {

@@ -4,7 +4,7 @@ Standalone Go SDK for multi-provider LLM streaming, context management, and agen
 
 ## Packages
 
-- **`velocitylabs.cc/sdk/provider`** — Streaming LLM providers (`openai-compatible`, `openrouter`, `responses`, `copilot`, `copilot-responses`, `chatgpt`, `xai`, `crof`, `zen`, `cline`, `kimi`), capability reporting, reasoning & `reasoning_details` persistence, PNG CRC repair, image compression, model discovery, non-SSE JSON completion fallback, and speech-to-text `Transcriber`s (OpenAI-style multipart `/audio/transcriptions` with optional SSE deltas, OpenRouter's JSON transcription endpoint, and chat-model audio input via `input_audio` with a customizable prompt). Credentials/tokens are injected by the host application (`APIKey` or `TokenSource`).
+- **`velocitylabs.cc/sdk/provider`** — Streaming LLM providers (`openai-compatible`, `openrouter`, `responses`, `copilot`, `copilot-responses`, `chatgpt`, `xai`, `crof`, `zen`, `cline`, `kimi`, `gemini`, `vertex`), capability reporting, reasoning & `reasoning_details` persistence, PNG CRC repair, image compression, model discovery, non-SSE JSON completion fallback, and speech-to-text `Transcriber`s (OpenAI-style multipart `/audio/transcriptions` with optional SSE deltas, OpenRouter's JSON transcription endpoint, and chat-model audio input via `input_audio` with a customizable prompt). Credentials/tokens are injected by the host application (`APIKey` or `TokenSource`).
 - **`velocitylabs.cc/sdk/inference`** — Provider `Registry`, `Router`, `Config`, automatic provider type detection, and `NewTranscriber` (`openai`, `openrouter`, `chat`).
 - **`velocitylabs.cc/sdk/context`** — Append-only `Event` log, capability-aware `RenderHistory`, token ceiling `ModelLimit`, registrable `ContextSection` internal context (only changed sections/lines are appended, so volatile context never breaks the prompt cache), and and prompt-cache-preserving `CompressConversation`, with optional `<files_to_retain>` file carry-over enabled by supplying a `FileReader` (`DirFileReader` for local disk).
 - **`velocitylabs.cc/sdk/webfetch`** — `web_fetch` tool: markdown-first URL fetching (`.md`, `.mdx`, `Accept: text/markdown`, then boilerplate-pruned HTML conversion with GFM tables), binary-payload notices, token-budgeted output, Cloudflare email decoding, an SSRF-safe `NewSafeClient`, a per-fetch cookie jar so challenge clearances survive the retries, an opt-in crawler-spoof ladder (Googlebot, Bingbot, GPTBot, ChatGPT-User, ClaudeBot, PerplexityBot, ...) for pages that serve a bot wall to unknown clients, and optional browser-fingerprint impersonation (`Impersonate` / `ImpersonateOnBlock`, or `ImpersonateClient` for a ready-made transport) which clears challenges a user-agent string cannot, and JavaScript interstitials (compute-and-submit forms, cookie-and-reload, timed redirects, meta refresh) cleared by running the page's inline scripts in an embedded JS engine over a minimal DOM, with no browser. Client-rendered apps (React, Ember, ...) can be rendered the same way with `RenderApps`, and an app shell that loads a data document (Swagger UI's OpenAPI spec, ...) returns that document.
@@ -34,6 +34,23 @@ sdk.Configure(sdk.Settings{
 	// DisableDebugFiles: true,           // never save failed request/response payloads to temp files
 })
 ```
+
+## Gemini Interactions API (Gemini API and Vertex AI)
+
+```go
+// Vertex AI: OAuth bearer token (APIKey, or TokenSource for rotating tokens)
+c, _ := inference.NewProvider(inference.Config{
+	Type: "vertex", Project: "my-project", Location: "global", APIKey: accessToken,
+	ExtraBody: map[string]any{"generation_config": map[string]any{"max_output_tokens": 262144, "thinking_level": "high"}},
+})
+// Gemini Developer API: Type "gemini" with an API key
+```
+
+`vertex` and `gemini` speak the stateless Interactions API: history is replayed as steps (signed `thought` steps ride in `ProviderMeta`), reasoning comes from thought summaries, and tool-call arguments stream chunk by chunk as `arguments_delta` events arrive.
+
+`ExtraBody` is merged into the create request, so `generation_config`, `background`, `store` and the like are set there. A `max_output_tokens` above 65,536 is long decode: `background` and `store` are switched on automatically, since the server only runs those as background interactions (up to 24 hours, 1M tokens shared by input, thinking and output).
+
+Long runs survive dropped connections. The interaction runs server side, so a broken or silent stream (5 minutes idle, 20 for background) is reattached with `last_event_id`, and if that is refused the interaction is polled to completion and the unseen output is delivered. `usage` reports total billed tokens, while the context estimate excludes the input re-counted by every long-decode hop.
 
 ## Web fetch
 
