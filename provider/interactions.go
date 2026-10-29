@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,10 +25,6 @@ const (
 	// InteractionsIDMetaKey holds the id of the stored interaction that produced
 	// an assistant turn.
 	InteractionsIDMetaKey = "interactions_id"
-
-	// longDecodeThreshold is the largest output a single synchronous interaction
-	// may produce; anything above it needs background execution.
-	longDecodeThreshold = 65536
 )
 
 var interactionsFallbackModels = []ModelInfo{
@@ -55,6 +52,7 @@ type interactionsProvider struct {
 	httpClient  *http.Client
 	baseURL     string
 	createURL   string
+	itemBase    string
 	vertex      bool
 	apiKey      string
 	tokenSource TokenSource
@@ -79,6 +77,7 @@ func NewInteractionsProvider(cfg InteractionsConfig) *interactionsProvider {
 		}
 		p.baseURL = base
 		p.createURL = base + "/interactions"
+		p.itemBase = p.createURL
 		return p
 	}
 
@@ -96,6 +95,7 @@ func NewInteractionsProvider(cfg InteractionsConfig) *interactionsProvider {
 	p.vertex = true
 	p.baseURL = base
 	p.createURL = fmt.Sprintf("%s/projects/%s/locations/%s/interactions", base, url.PathEscape(project), url.PathEscape(location))
+	p.itemBase = p.createURL
 	return p
 }
 
@@ -109,7 +109,7 @@ func (p *interactionsProvider) Capabilities() Capabilities {
 }
 
 func (p *interactionsProvider) interactionURL(id string) string {
-	return p.baseURL + "/interactions/" + url.PathEscape(id)
+	return p.itemBase + "/" + url.PathEscape(id)
 }
 
 func (p *interactionsProvider) setAuth(ctx context.Context, req *http.Request) error {
@@ -154,9 +154,12 @@ func (p *interactionsProvider) StreamChat(ctx context.Context, req ChatRequest) 
 // request extra bodies are deep-merged over it, so generation_config,
 // background, store and the like can be set from configuration.
 //
-// An output budget above 64K tokens ("long decode") only works through
-// background execution, which in turn requires a stored interaction, so both
-// are enabled automatically unless explicitly set.
+// Interactions run in the background by default, with the stream attached to
+// it. A foreground interaction is cancelled by the server as soon as its
+// connection drops, while a background one keeps running and can be resumed.
+// Background execution also unlocks output above 64K tokens ("long decode") and
+// requires a stored interaction, which is the API default anyway. Setting
+// store to false (or background to false) opts out.
 func BuildInteractionsBody(req ChatRequest, providerExtra map[string]any) ([]byte, error) {
 	payload, err := buildInteractionsPayload(req, providerExtra)
 	if err != nil {
@@ -194,8 +197,8 @@ func buildInteractionsPayload(req ChatRequest, providerExtra map[string]any) (ma
 	body["input"] = input
 	body["stream"] = true
 
-	if interactionsMaxOutput(body) > longDecodeThreshold {
-		if _, set := body["background"]; !set {
+	if _, set := body["background"]; !set {
+		if store, _ := body["store"].(bool); store || body["store"] == nil {
 			body["background"] = true
 		}
 	}
@@ -205,22 +208,6 @@ func buildInteractionsPayload(req ChatRequest, providerExtra map[string]any) (ma
 		}
 	}
 	return body, nil
-}
-
-func interactionsMaxOutput(body map[string]any) int {
-	config, _ := body["generation_config"].(map[string]any)
-	switch n := config["max_output_tokens"].(type) {
-	case int:
-		return n
-	case int64:
-		return int(n)
-	case float64:
-		return int(n)
-	case json.Number:
-		v, _ := n.Int64()
-		return int(v)
-	}
-	return 0
 }
 
 func interactionsToolChoice(choice string) string {
@@ -391,7 +378,7 @@ func (p *interactionsProvider) fetchGeminiModels(ctx context.Context) ([]ModelIn
 	models := make([]ModelInfo, 0, len(listing.Models))
 	for _, m := range listing.Models {
 		id := strings.TrimPrefix(m.Name, "models/")
-		if !strings.HasPrefix(id, "gemini") {
+		if !interactionsSupportsModel(id) {
 			continue
 		}
 		models = append(models, ModelInfo{ID: id, Name: m.DisplayName, Description: m.Description, ContextLength: m.InputTokenLimit})
@@ -400,23 +387,52 @@ func (p *interactionsProvider) fetchGeminiModels(ctx context.Context) ([]ModelIn
 }
 
 func (p *interactionsProvider) fetchVertexModels(ctx context.Context) ([]ModelInfo, error) {
-	var listing struct {
-		PublisherModels []struct {
-			Name string `json:"name"`
-		} `json:"publisherModels"`
-	}
-	if err := p.getJSON(ctx, p.baseURL+"/publishers/google/models?pageSize=1000", &listing); err != nil {
-		return nil, err
-	}
 	seen := map[string]bool{}
-	models := make([]ModelInfo, 0, len(listing.PublisherModels))
-	for _, m := range listing.PublisherModels {
-		id := m.Name[strings.LastIndex(m.Name, "/")+1:]
-		if !strings.HasPrefix(id, "gemini") || seen[id] {
-			continue
+	var models []ModelInfo
+	pageToken := ""
+	for page := 0; page < 10; page++ {
+		var listing struct {
+			PublisherModels []struct {
+				Name string `json:"name"`
+			} `json:"publisherModels"`
+			NextPageToken string `json:"nextPageToken"`
 		}
-		seen[id] = true
-		models = append(models, ModelInfo{ID: id})
+		target := p.baseURL + "/publishers/google/models?pageSize=300"
+		if pageToken != "" {
+			target += "&pageToken=" + url.QueryEscape(pageToken)
+		}
+		if err := p.getJSON(ctx, target, &listing); err != nil {
+			return nil, err
+		}
+		for _, m := range listing.PublisherModels {
+			id := m.Name[strings.LastIndex(m.Name, "/")+1:]
+			if !interactionsSupportsModel(id) || seen[id] {
+				continue
+			}
+			seen[id] = true
+			models = append(models, ModelInfo{ID: id})
+		}
+		if pageToken = listing.NextPageToken; pageToken == "" {
+			break
+		}
 	}
 	return models, nil
+}
+
+// interactionsSupportsModel reports whether id is a Gemini 3+ text model, the
+// generations the Interactions API serves.
+func interactionsSupportsModel(id string) bool {
+	rest, ok := strings.CutPrefix(id, "gemini-")
+	if !ok {
+		return false
+	}
+	for _, other := range []string{"image", "transcribe", "live", "tts", "embedding", "translate"} {
+		if strings.Contains(rest, other) {
+			return false
+		}
+	}
+	major, _, _ := strings.Cut(rest, ".")
+	major, _, _ = strings.Cut(major, "-")
+	n, err := strconv.Atoi(major)
+	return err == nil && n >= 3
 }

@@ -116,8 +116,28 @@ type interactionsEvent struct {
 type interactionsStep struct {
 	typ       string
 	toolIndex int
-	argsSeen  bool
 	signature string
+	stopped   bool
+}
+
+// replayGate drops the part of a replayed stream the consumer already has.
+// When a stream is restarted from its first event, everything that arrives
+// again is counted as seen and only the bytes beyond what was sent are passed on.
+type replayGate struct{ sent, seen int }
+
+func (g *replayGate) take(text string) string {
+	g.seen += len(text)
+	if g.seen <= g.sent {
+		return ""
+	}
+	fresh := min(len(text), g.seen-g.sent)
+	g.sent = g.seen
+	return text[len(text)-fresh:]
+}
+
+type interactionsTool struct {
+	args      replayGate
+	emptyDone bool
 }
 
 type interactionsTransient struct{ err error }
@@ -145,9 +165,10 @@ type interactionsStream struct {
 
 	steps     map[int]*interactionsStep
 	thoughts  []map[string]any
-	toolIndex int
-	emitted   bool
-	textBytes int
+	tools     []*interactionsTool
+	toolSeen  int
+	text      replayGate
+	reasoning replayGate
 
 	resumes int
 	pending []StreamEvent
@@ -289,7 +310,6 @@ func (s *interactionsStream) readPayload() (string, error) {
 }
 
 func (s *interactionsStream) emit(ev StreamEvent) {
-	s.emitted = true
 	s.pending = append(s.pending, ev)
 }
 
@@ -352,22 +372,30 @@ func (s *interactionsStream) handle(payload string) error {
 }
 
 func (s *interactionsStream) startStep(ev interactionsEvent) {
+	if prev := s.steps[ev.Index]; prev != nil && prev.typ == ev.Step.Type && !prev.stopped {
+		return
+	}
 	step := &interactionsStep{typ: ev.Step.Type}
 	s.steps[ev.Index] = step
 	if step.typ != "function_call" {
 		return
 	}
 
+	step.toolIndex = s.toolSeen
+	s.toolSeen++
+	if step.toolIndex < len(s.tools) {
+		return
+	}
+	tool := &interactionsTool{}
+	s.tools = append(s.tools, tool)
+
 	id := ev.Step.ID
 	if id == "" {
 		id = "call_" + uuid.NewString()
 	}
-	step.toolIndex = s.toolIndex
-	s.toolIndex++
 	delta := ToolCallDelta{Index: step.toolIndex, ID: id, Type: "function", FunctionName: ev.Step.Name}
 	if args := strings.TrimSpace(string(ev.Step.Arguments)); args != "" && args != "{}" && args != "null" {
-		delta.FunctionArguments = args
-		step.argsSeen = true
+		delta.FunctionArguments = tool.args.take(args)
 	}
 	s.emit(StreamEvent{ToolCallDeltas: []ToolCallDelta{delta}})
 }
@@ -382,28 +410,31 @@ func (s *interactionsStream) stepDelta(ev interactionsEvent) {
 
 	switch delta.Type {
 	case "text":
-		if delta.Text == "" {
-			return
-		}
 		if step.typ == "thought" {
-			s.emit(StreamEvent{Reasoning: delta.Text})
+			s.emitReasoning(delta.Text)
 			return
 		}
-		s.textBytes += len(delta.Text)
-		s.emit(StreamEvent{Content: delta.Text})
-	case "thought_summary":
-		if delta.Content.Text != "" {
-			s.emit(StreamEvent{Reasoning: delta.Content.Text})
+		if text := s.text.take(delta.Text); text != "" {
+			s.emit(StreamEvent{Content: text})
 		}
+	case "thought_summary":
+		s.emitReasoning(delta.Content.Text)
 	case "thought_signature":
 		step.signature = delta.Signature
 	case "arguments_delta":
-		chunk := rawArgumentsChunk(delta.Arguments)
-		if chunk == "" {
+		if step.typ != "function_call" || step.toolIndex >= len(s.tools) {
 			return
 		}
-		step.argsSeen = true
-		s.emit(StreamEvent{ToolCallDeltas: []ToolCallDelta{{Index: step.toolIndex, FunctionArguments: chunk}}})
+		chunk := s.tools[step.toolIndex].args.take(rawArgumentsChunk(delta.Arguments))
+		if chunk != "" {
+			s.emit(StreamEvent{ToolCallDeltas: []ToolCallDelta{{Index: step.toolIndex, FunctionArguments: chunk}}})
+		}
+	}
+}
+
+func (s *interactionsStream) emitReasoning(text string) {
+	if text = s.reasoning.take(text); text != "" {
+		s.emit(StreamEvent{Reasoning: text})
 	}
 }
 
@@ -426,10 +457,11 @@ func (s *interactionsStream) stopStep(index int) {
 	if step == nil {
 		return
 	}
+	step.stopped = true
 	switch step.typ {
 	case "function_call":
-		if !step.argsSeen {
-			step.argsSeen = true
+		if tool := s.tools[step.toolIndex]; tool.args.seen == 0 && !tool.emptyDone {
+			tool.emptyDone = true
 			s.emit(StreamEvent{ToolCallDeltas: []ToolCallDelta{{Index: step.toolIndex, FunctionArguments: "{}"}}})
 		}
 	case "thought":
@@ -494,7 +526,7 @@ func (s *interactionsStream) finish() {
 		}
 		return
 	case "cancelled":
-		s.failure = errors.New("interaction was cancelled")
+		s.failure = &ServerError{StatusCode: http.StatusServiceUnavailable, Message: "interaction was cancelled by the server (a foreground interaction is cancelled when its connection drops)"}
 		return
 	}
 	s.failure = nil
@@ -503,7 +535,7 @@ func (s *interactionsStream) finish() {
 	switch {
 	case s.status == "incomplete":
 		ev.FinishReason = "length"
-	case s.status == "requires_action", s.toolIndex > 0:
+	case s.status == "requires_action", len(s.tools) > 0:
 		ev.FinishReason = "tool_calls"
 	}
 	if s.usage != nil {
@@ -554,9 +586,6 @@ func (s *interactionsStream) recover(cause error) error {
 	})
 
 	for s.resumes < interactionsMaxResumes {
-		if s.lastEventID == "" && s.emitted {
-			break
-		}
 		s.resumes++
 		if err := s.wait(resumeBackoff(s.resumes)); err != nil {
 			return err
@@ -565,6 +594,8 @@ func (s *interactionsStream) recover(cause error) error {
 		query := url.Values{"stream": {"true"}}
 		if s.lastEventID != "" {
 			query.Set("last_event_id", s.lastEventID)
+		} else {
+			s.rewind()
 		}
 		err := s.open(http.MethodGet, s.p.interactionURL(s.interactionID)+"?"+query.Encode(), nil)
 		if err == nil {
@@ -581,6 +612,19 @@ func (s *interactionsStream) recover(cause error) error {
 		}
 	}
 	return s.poll(cause)
+}
+
+// rewind prepares for a stream replayed from its first event, which is all the
+// server can offer before the first event id has been seen.
+func (s *interactionsStream) rewind() {
+	s.steps = map[int]*interactionsStep{}
+	s.thoughts = nil
+	s.toolSeen = 0
+	s.text.seen = 0
+	s.reasoning.seen = 0
+	for _, tool := range s.tools {
+		tool.args.seen = 0
+	}
 }
 
 type interactionsResource struct {
@@ -633,8 +677,8 @@ func (s *interactionsStream) poll(cause error) error {
 
 func (s *interactionsStream) replayResource(res interactionsResource) {
 	var text strings.Builder
-	calls := 0
 	var thoughts []map[string]any
+	calls := 0
 	for _, step := range res.Steps {
 		switch step.Type {
 		case "model_output":
@@ -648,7 +692,7 @@ func (s *interactionsStream) replayResource(res interactionsResource) {
 				thoughts = append(thoughts, map[string]any{"type": "thought", "signature": step.Signature})
 			}
 		case "function_call":
-			if calls >= s.toolIndex {
+			if calls >= len(s.tools) {
 				id := step.ID
 				if id == "" {
 					id = "call_" + uuid.NewString()
@@ -657,19 +701,21 @@ func (s *interactionsStream) replayResource(res interactionsResource) {
 				if args == "" || args == "null" {
 					args = "{}"
 				}
+				tool := &interactionsTool{emptyDone: true}
+				tool.args.take(args)
+				s.tools = append(s.tools, tool)
 				s.emit(StreamEvent{ToolCallDeltas: []ToolCallDelta{{Index: calls, ID: id, Type: "function", FunctionName: step.Name, FunctionArguments: args}}})
 			}
 			calls++
 		}
 	}
-	if full := text.String(); len(full) > s.textBytes {
-		s.pending = append([]StreamEvent{{Content: full[s.textBytes:]}}, s.pending...)
-		s.textBytes = len(full)
+	s.text.seen = 0
+	if fresh := s.text.take(text.String()); fresh != "" {
+		s.pending = append([]StreamEvent{{Content: fresh}}, s.pending...)
 	}
 	if len(s.thoughts) == 0 {
 		s.thoughts = thoughts
 	}
-	s.toolIndex = max(s.toolIndex, calls)
 	s.status = res.Status
 	if res.Usage != nil {
 		s.usage = res.Usage

@@ -48,9 +48,9 @@ c, _ := inference.NewProvider(inference.Config{
 
 `vertex` and `gemini` speak the stateless Interactions API: history is replayed as steps (signed `thought` steps ride in `ProviderMeta`), reasoning comes from thought summaries, and tool-call arguments stream chunk by chunk as `arguments_delta` events arrive.
 
-`ExtraBody` is merged into the create request, so `generation_config`, `background`, `store` and the like are set there. A `max_output_tokens` above 65,536 is long decode: `background` and `store` are switched on automatically, since the server only runs those as background interactions (up to 24 hours, 1M tokens shared by input, thinking and output).
+`ExtraBody` is merged into the create request, so `generation_config` (`thinking_level`, `max_output_tokens`, ...), `background`, `store` and the like are set there. Interactions run with `background: true` (and the default `store: true`) unless you set `background` or `store` to false: Vertex cancels a foreground interaction the moment its connection drops, while a background one keeps running server side. That also unlocks long decode, a `max_output_tokens` above 65,536 (up to 1M tokens shared by input, thinking and output, up to 24 hours), on models that support it such as `gemini-4-argon`; others reject the budget with a 400.
 
-Long runs survive dropped connections. The interaction runs server side, so a broken or silent stream (5 minutes idle, 20 for background) is reattached with `last_event_id`, and if that is refused the interaction is polled to completion and the unseen output is delivered. `usage` reports total billed tokens, while the context estimate excludes the input re-counted by every long-decode hop.
+A broken or silent stream (5 minutes idle, 20 for long budgets) is reattached with `last_event_id`, or replayed from the start while skipping what was already delivered, and if neither works the interaction is polled to completion. `usage` reports total billed tokens, while the context estimate excludes the input re-counted by every long-decode hop.
 
 ## Web fetch
 
