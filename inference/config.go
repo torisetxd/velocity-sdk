@@ -15,6 +15,7 @@ type Config struct {
 	ReasoningField          string               `yaml:"reasoning_field" json:"reasoning_field"`
 	Project                 string               `yaml:"project" json:"project"`
 	Location                string               `yaml:"location" json:"location"`
+	Credentials             string               `yaml:"credentials" json:"credentials"`
 	TokenSource             provider.TokenSource `yaml:"-" json:"-"`
 }
 
@@ -25,6 +26,7 @@ func (c Config) Normalized() Config {
 	c.ReasoningField = strings.TrimSpace(c.ReasoningField)
 	c.Project = strings.TrimSpace(c.Project)
 	c.Location = strings.TrimSpace(c.Location)
+	c.Credentials = strings.TrimSpace(c.Credentials)
 	c.ExtraBody = provider.CopyMapAny(c.ExtraBody)
 	return c
 }

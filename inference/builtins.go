@@ -194,13 +194,25 @@ func registerBuiltins(registry *Registry) {
 		if config.Project == "" {
 			return nil, fmt.Errorf("vertex provider requires a project")
 		}
+		tokenSource, apiKey := config.TokenSource, config.APIKey
+		if tokenSource == nil && (config.Credentials != "" || strings.HasPrefix(apiKey, "{") || apiKey == "") {
+			credentials := config.Credentials
+			if credentials == "" {
+				credentials = apiKey
+			}
+			source, err := provider.GoogleTokenSource(credentials)
+			if err != nil {
+				return nil, err
+			}
+			tokenSource, apiKey = source, ""
+		}
 		return provider.NewInteractionsProvider(provider.InteractionsConfig{
 			APIURL:      config.APIURL,
-			APIKey:      config.APIKey,
+			APIKey:      apiKey,
 			Project:     config.Project,
 			Location:    config.Location,
 			ExtraBody:   config.ExtraBody,
-			TokenSource: config.TokenSource,
+			TokenSource: tokenSource,
 		}), nil
 	}, "vertex-ai", "vertex-interactions")
 }

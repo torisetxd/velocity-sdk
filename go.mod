@@ -11,10 +11,12 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/tiktoken-go/tokenizer v0.8.1
 	golang.org/x/net v0.61.0
+	golang.org/x/oauth2 v0.37.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
+	cloud.google.com/go/compute/metadata v0.3.0 // indirect
 	github.com/JohannesKaufmann/dom v0.3.1 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bdandy/go-errors v1.2.2 // indirect

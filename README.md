@@ -38,9 +38,11 @@ sdk.Configure(sdk.Settings{
 ## Gemini Interactions API (Gemini API and Vertex AI)
 
 ```go
-// Vertex AI: OAuth bearer token (APIKey, or TokenSource for rotating tokens)
+// Vertex AI: Credentials is a service-account JSON file (or its contents); empty means
+// Application Default Credentials. Access tokens are minted and refreshed per request.
+// A TokenSource or a ready-made bearer token in APIKey also works.
 c, _ := inference.NewProvider(inference.Config{
-	Type: "vertex", Project: "my-project", Location: "global", APIKey: accessToken,
+	Type: "vertex", Project: "my-project", Location: "global", Credentials: "~/key.json",
 	ExtraBody: map[string]any{"generation_config": map[string]any{"max_output_tokens": 262144, "thinking_level": "high"}},
 })
 // Gemini Developer API: Type "gemini" with an API key
