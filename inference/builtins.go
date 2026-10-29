@@ -107,6 +107,9 @@ func DefaultURLForType(providerType string) string {
 		return DefaultKimiURL
 	case TypeGemini:
 		return DefaultGeminiURL
+	case TypeVertex:
+		// derived from the project's location, see provider.InteractionsConfig
+		return ""
 	default:
 		return DefaultOpenAICompatibleURL
 	}
