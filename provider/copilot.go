@@ -92,6 +92,7 @@ func (p *copilotResponsesProvider) StreamChat(ctx context.Context, req ChatReque
 		body,
 		extraHeaders,
 		"",
+		nil,
 	)
 }
 

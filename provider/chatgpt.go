@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"velocitylabs.cc/sdk/internal/debugtrace"
 )
 
 const (
@@ -15,12 +19,15 @@ const (
 )
 
 type chatgptProvider struct {
-	inner *responsesProvider
+	inner    *responsesProvider
+	turns    chatGPTTurnCache
+	warnOnce sync.Once
 }
 
-// NewChatGPTProvider constructs a stateless ChatGPT Responses provider.
-// Credentials/tokens are supplied by the host application via apiKey or an
-// optional TokenSource.
+// NewChatGPTProvider constructs a ChatGPT Responses provider. Requests are
+// stateless apart from the sticky-routing token the route returns for the
+// current turn. Credentials/tokens are supplied by the host application via
+// apiKey or an optional TokenSource.
 func NewChatGPTProvider(apiURL, apiKey string, extraBody map[string]any, tokenSource ...TokenSource) Provider {
 	inner := NewResponsesProvider(apiURL, apiKey, extraBody)
 	if len(tokenSource) > 0 && tokenSource[0] != nil {
@@ -43,11 +50,44 @@ func (p *chatgptProvider) StreamChat(ctx context.Context, req ChatRequest) (Chat
 	if err != nil {
 		return nil, err
 	}
-	body, err = enableChatGPTStatelessReasoningPersistence(body)
+	payload, err := enableChatGPTStatelessReasoningPersistence(body)
 	if err != nil {
 		return nil, err
 	}
-	stream, err := streamResponses(ctx, p.inner.httpClient, p.inner.apiURL, token, body, chatGPTSessionHeaders(req.PromptCacheKey), chatGPTResponsesOutputKey)
+	affinity, err := chatGPTAffinityKey(req.PromptCacheKey, payload)
+	if err != nil {
+		return nil, err
+	}
+	payload["prompt_cache_key"] = affinity
+	body, err = json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode ChatGPT Responses request: %w", err)
+	}
+
+	turnState := p.turns.get(req.TurnID, token)
+	trace := chatGPTRequestTrace{
+		sentSessionID: affinity,
+		sentCacheKey:  affinity,
+		turnStateSent: turnState != "",
+		turnStateLen:  len(turnState),
+	}
+	observer := &responsesObserver{
+		Headers: func(streamID string, header http.Header) {
+			logChatGPTResponseCacheHeaders(streamID, header)
+			state := strings.TrimSpace(header.Get(chatGPTTurnStateHeader))
+			trace.turnStateSeen, trace.turnStateNewLen = state != "", len(state)
+			p.turns.put(req.TurnID, token, state)
+		},
+		Complete: func(echoedPromptCacheKey string, usage *TokenUsage) {
+			trace.echoedCacheKey = echoedPromptCacheKey
+			if usage != nil {
+				trace.cachedTokens, trace.inputTokens = usage.CachedTokens, usage.InputTokens
+			}
+			trace.log()
+			p.warnAffinityUnhonored(affinity, echoedPromptCacheKey)
+		},
+	}
+	stream, err := streamResponses(ctx, p.inner.httpClient, p.inner.apiURL, token, body, chatGPTRequestHeaders(req, affinity, turnState), chatGPTResponsesOutputKey, observer)
 	if err != nil {
 		return nil, err
 	}
@@ -57,15 +97,17 @@ func (p *chatgptProvider) StreamChat(ctx context.Context, req ChatRequest) (Chat
 	return stream, nil
 }
 
-func chatGPTSessionHeaders(promptCacheKey string) map[string]string {
-	if promptCacheKey == "" {
-		return nil
+func (p *chatgptProvider) warnAffinityUnhonored(sent, echoed string) {
+	if echoed == "" || echoed == sent {
+		return
 	}
-	return map[string]string{
-		"session-id":          promptCacheKey,
-		"thread-id":           promptCacheKey,
-		"x-client-request-id": promptCacheKey,
-	}
+	p.warnOnce.Do(func() {
+		debugtrace.Log("provider.affinity_unhonored", map[string]any{
+			"sent_prompt_cache_key":   sent,
+			"echoed_prompt_cache_key": echoed,
+		})
+		fmt.Fprintln(os.Stderr, "affinity header not honored on this route")
+	})
 }
 
 func (p *chatgptProvider) Capabilities() Capabilities {
@@ -110,7 +152,10 @@ func (p *chatgptProvider) FetchModels(ctx context.Context) ([]ModelInfo, error) 
 	return p.inner.FetchModels(ctx)
 }
 
-func enableChatGPTStatelessReasoningPersistence(body []byte) ([]byte, error) {
+// enableChatGPTStatelessReasoningPersistence normalizes a Responses request for
+// the subscription route and returns the decoded payload so the caller can
+// derive the cache affinity from it before encoding.
+func enableChatGPTStatelessReasoningPersistence(body []byte) (map[string]any, error) {
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
 		return nil, fmt.Errorf("invalid ChatGPT Responses request")
@@ -186,7 +231,7 @@ func enableChatGPTStatelessReasoningPersistence(body []byte) ([]byte, error) {
 		}
 		payload["tools"] = supported
 	}
-	return json.Marshal(payload)
+	return payload, nil
 }
 
 func translateSystemToDeveloper(req ChatRequest) ChatRequest {

@@ -69,6 +69,10 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 
 	vcontext.FlushInternalContext(&history, &renderedHistory, caps, r.InternalContext)
 
+	// One id per user turn: providers that carry per-turn server state reuse it
+	// across the tool rounds of this turn and never across turns.
+	turnID := uuid.New().String()
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return TurnResult{
@@ -101,6 +105,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 			Stream:         true,
 			ExtraBody:      provider.CopyMapAny(r.ModelExtra),
 			PromptCacheKey: vcontext.PromptCacheKeyForSession(r.Provider, r.PromptCacheEnabled, sess.ID),
+			TurnID:         turnID,
 		}
 		if len(definitions) == 0 {
 			req.ToolChoice = ""

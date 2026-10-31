@@ -40,6 +40,15 @@ type ChatRequest struct {
 	StreamOpts     *StreamOptions `json:"stream_options,omitempty"`
 	PromptCacheKey string         `json:"-"`
 	ExtraBody      map[string]any `json:"-"`
+	// TurnID identifies the user turn this request belongs to. Providers that
+	// keep per-turn server state (the ChatGPT subscription route) reuse it
+	// inside the turn and drop it when the id changes.
+	TurnID string `json:"-"`
+	// CodexWindowID, CodexTurnMetadata and CodexParentThreadID are forwarded as
+	// x-codex-* headers on the ChatGPT subscription route when set.
+	CodexWindowID       string `json:"-"`
+	CodexTurnMetadata   string `json:"-"`
+	CodexParentThreadID string `json:"-"`
 }
 
 type StreamOptions struct {

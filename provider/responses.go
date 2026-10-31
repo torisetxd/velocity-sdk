@@ -404,6 +404,16 @@ func generateShortID() string {
 	return fmt.Sprintf("%d", idCounter)
 }
 
+// responsesObserver lets a caller inspect response metadata. The API-key path
+// passes nil and keeps the previous behaviour.
+type responsesObserver struct {
+	// Headers receives the response headers before the body is streamed.
+	Headers func(streamID string, header http.Header)
+	// Complete receives the prompt_cache_key echoed by the response together
+	// with the normalized usage of the completed response.
+	Complete func(echoedPromptCacheKey string, usage *TokenUsage)
+}
+
 type responsesStream struct {
 	ctx               context.Context
 	resp              *http.Response
@@ -418,6 +428,7 @@ type responsesStream struct {
 	requireCompletion bool
 	completed         bool
 	accessToken       string
+	observer          *responsesObserver
 
 	toolCallArgs map[string]string
 	toolCallInfo map[string]struct {
@@ -435,6 +446,7 @@ func streamResponses(
 	body []byte,
 	extraHeaders map[string]string,
 	outputMetaKey string,
+	observer *responsesObserver,
 ) (ChatStream, error) {
 	endpoint := ProviderEndpoint(apiURL, "responses")
 	streamID := debugtrace.NextID()
@@ -483,6 +495,9 @@ func streamResponses(
 		"content_type": resp.Header.Get("Content-Type"),
 		"request_id":   resp.Header.Get("X-Request-ID"),
 	})
+	if observer != nil && observer.Headers != nil {
+		observer.Headers(streamID, resp.Header)
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
@@ -526,6 +541,7 @@ func streamResponses(
 		outputMetaKey: outputMetaKey,
 		streamID:      streamID,
 		accessToken:   apiKey,
+		observer:      observer,
 		toolCallArgs:  make(map[string]string),
 		toolCallInfo: make(map[string]struct {
 			Index int
@@ -910,8 +926,9 @@ func (s *responsesStream) parseFunctionCallArgsDone(payload string) *StreamEvent
 func (s *responsesStream) parseCompletedEvent(payload string) *StreamEvent {
 	var raw struct {
 		Response struct {
-			Output []map[string]any  `json:"output"`
-			Usage  tokenUsagePayload `json:"usage"`
+			Output         []map[string]any  `json:"output"`
+			Usage          tokenUsagePayload `json:"usage"`
+			PromptCacheKey string            `json:"prompt_cache_key"`
 		} `json:"response"`
 	}
 	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
@@ -920,6 +937,9 @@ func (s *responsesStream) parseCompletedEvent(payload string) *StreamEvent {
 
 	usage := raw.Response.Usage.normalized()
 	s.completed = true
+	if s.observer != nil && s.observer.Complete != nil {
+		s.observer.Complete(raw.Response.PromptCacheKey, usage)
+	}
 	event := &StreamEvent{Usage: usage}
 	if usage != nil {
 		event.TotalTokens = usage.TotalTokens
@@ -962,5 +982,6 @@ func (p *responsesProvider) StreamChat(ctx context.Context, req ChatRequest) (Ch
 		body,
 		nil,
 		"",
+		nil,
 	)
 }

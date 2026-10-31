@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/google/uuid"
 	"velocitylabs.cc/sdk/provider"
 )
 
@@ -63,6 +64,7 @@ func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRe
 		Stream:         true,
 		ExtraBody:      provider.CopyMapAny(modelExtra),
 		PromptCacheKey: strings.TrimSpace(opts.PromptCacheKey),
+		TurnID:         uuid.New().String(),
 	}
 
 	stream, err := p.StreamChat(ctx, req)

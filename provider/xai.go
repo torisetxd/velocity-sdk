@@ -59,6 +59,7 @@ func (p *xaiProvider) StreamChat(ctx context.Context, req ChatRequest) (ChatStre
 		body,
 		nil,
 		xaiResponsesOutputKey,
+		nil,
 	)
 }
 
