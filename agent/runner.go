@@ -106,9 +106,20 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 			req.ToolChoice = ""
 		}
 
+		turnCtx, interruptTurn, cleanupTurn := withTurnInterrupt(ctx)
+		if r.AwaitInterrupt != nil {
+			go func() {
+				if r.AwaitInterrupt(turnCtx) {
+					interruptTurn()
+				}
+			}()
+		}
+
 		var toolResults []any
-		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, err := r.RunSingleTurn(ctx, req, &toolResults)
-		if err != nil {
+		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, err := r.RunSingleTurn(turnCtx, req, &toolResults)
+		interrupted := IsTurnInterrupted(turnCtx)
+		if err != nil && !interrupted {
+			cleanupTurn()
 			return TurnResult{
 				History:          history,
 				Reasoning:        allReasoning,
@@ -129,20 +140,27 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		if assistantText != "" {
 			allContent += assistantText
 		}
-		lastReportedTotalTokens = tokens
 		if tokens > 0 {
+			lastReportedTotalTokens = tokens
 			prevTotalTokens = lastTotalTokens
 			lastTotalTokens = tokens
+		} else if !interrupted {
+			lastReportedTotalTokens = tokens
 		}
 
-		if strings.TrimSpace(assistantText) == "" && len(toolCalls) == 0 {
+		if !interrupted && strings.TrimSpace(assistantText) == "" && len(toolCalls) == 0 {
 			maxEmptyRetries := r.effectiveMaxEmptyRetries()
 			for attempt := 1; attempt <= maxEmptyRetries; attempt++ {
 				clearEmptyRetry := func() {
 					r.emitRetry(RetryStatus{Attempt: attempt, Max: maxEmptyRetries, Done: true, Reason: "empty response"})
 				}
-				if err := ctx.Err(); err != nil {
+				if err := turnCtx.Err(); err != nil {
 					clearEmptyRetry()
+					if IsTurnInterrupted(turnCtx) {
+						interrupted = true
+						break
+					}
+					cleanupTurn()
 					return TurnResult{
 						History:          history,
 						Reasoning:        allReasoning,
@@ -151,7 +169,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 						Trace:            trace,
 						Warnings:         warnings,
 						TotalTokens:      lastTotalTokens,
-					}, err
+					}, ctx.Err()
 				}
 
 				r.emitRetry(RetryStatus{Attempt: attempt, Max: maxEmptyRetries, Done: false, Reason: "empty response"})
@@ -159,9 +177,14 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 				backoff := time.Duration(100+rand.Intn(200)) * time.Millisecond
 				timer := time.NewTimer(backoff)
 				select {
-				case <-ctx.Done():
+				case <-turnCtx.Done():
 					timer.Stop()
 					clearEmptyRetry()
+					if IsTurnInterrupted(turnCtx) {
+						interrupted = true
+						break
+					}
+					cleanupTurn()
 					return TurnResult{
 						History:          history,
 						Reasoning:        allReasoning,
@@ -173,12 +196,35 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 					}, ctx.Err()
 				case <-timer.C:
 				}
+				if interrupted {
+					break
+				}
 
 				toolResults = nil
 				var emptyRetryErr error
-				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, emptyRetryErr = r.RunSingleTurn(ctx, req, &toolResults)
+				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, emptyRetryErr = r.RunSingleTurn(turnCtx, req, &toolResults)
+				if IsTurnInterrupted(turnCtx) {
+					clearEmptyRetry()
+					interrupted = true
+					if reasoningText != "" {
+						allReasoning += reasoningText
+					}
+					if len(reasoningDetails) > 0 {
+						provider.AppendReasoningDetails(&allReasoningDetails, reasoningDetails)
+					}
+					if assistantText != "" {
+						allContent += assistantText
+					}
+					if tokens > 0 {
+						lastReportedTotalTokens = tokens
+						prevTotalTokens = lastTotalTokens
+						lastTotalTokens = tokens
+					}
+					break
+				}
 				if emptyRetryErr != nil {
 					clearEmptyRetry()
+					cleanupTurn()
 					return TurnResult{
 						History:          history,
 						Reasoning:        allReasoning,
@@ -210,6 +256,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 				}
 				if attempt >= maxEmptyRetries {
 					clearEmptyRetry()
+					cleanupTurn()
 					return TurnResult{
 						History:          history,
 						Reasoning:        allReasoning,
@@ -221,6 +268,51 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 					}, fmt.Errorf("model returned empty response after %d retries", maxEmptyRetries)
 				}
 			}
+		}
+		cleanupTurn()
+
+		if interrupted {
+			if strings.TrimSpace(assistantText) != "" || len(toolCalls) > 0 {
+				turnTokens := tokens - prevTotalTokens
+				if turnTokens < 0 {
+					turnTokens = tokens
+				}
+				assistantEvent := AssistantEvent(assistantText, reasoningText, reasoningDetails, toolCalls, turnTokens)
+				assistantEvent.OccurredAt = time.Now().UTC().Format(time.RFC3339Nano)
+				model := r.Model
+				assistantEvent.Model = &model
+				assistantEvent.ProviderMeta = provider.CopyMapAny(providerMeta)
+				if r.DecorateAssistantEvent != nil {
+					r.DecorateAssistantEvent(&assistantEvent)
+				}
+				history = append(history, assistantEvent)
+				renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(assistantEvent, caps))
+				for i, tc := range toolCalls {
+					trace = append(trace, fmt.Sprintf("- %s(%s)", tc.Name, tc.Arguments))
+					toolEvent := ToolResultEvent(tc.ID, toolResults[i])
+					history = append(history, toolEvent)
+					renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(toolEvent, caps))
+				}
+			}
+			vcontext.FlushInternalContext(&history, &renderedHistory, caps, r.InternalContext)
+			steered := r.drainQueuedPrompts(ctx, &history, &renderedHistory, caps)
+			if !steered {
+				steered = r.drainEndOfRunQueue(ctx, &history, &renderedHistory, caps)
+			}
+			if !steered && len(toolCalls) == 0 {
+				return TurnResult{
+					History:          history,
+					Reasoning:        allReasoning,
+					ReasoningDetails: allReasoningDetails,
+					Reply:            assistantText,
+					Trace:            trace,
+					Warnings:         warnings,
+					TotalTokens:      lastTotalTokens,
+				}, nil
+			}
+			toolRounds = 0
+			forceFinal = false
+			continue
 		}
 
 		turnTokens := tokens - prevTotalTokens
@@ -247,6 +339,7 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		if len(toolCalls) == 0 && continuation != "" {
 			r.appendUserMessage(ctx, &history, &renderedHistory, continuation, caps)
 			r.drainQueuedPrompts(ctx, &history, &renderedHistory, caps)
+			r.drainEndOfRunQueue(ctx, &history, &renderedHistory, caps)
 			continue
 		}
 
@@ -276,10 +369,17 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		vcontext.FlushInternalContext(&history, &renderedHistory, caps, r.InternalContext)
 
 		if r.drainQueuedPrompts(ctx, &history, &renderedHistory, caps) {
+			toolRounds = 0
+			forceFinal = false
 			continue
 		}
 
 		if len(toolCalls) == 0 {
+			if r.drainEndOfRunQueue(ctx, &history, &renderedHistory, caps) {
+				toolRounds = 0
+				forceFinal = false
+				continue
+			}
 			return TurnResult{
 				History:          history,
 				Reasoning:        allReasoning,
@@ -394,6 +494,20 @@ func (r Runner) drainQueuedPrompts(ctx context.Context, history *[]Event, render
 	return true
 }
 
+func (r Runner) drainEndOfRunQueue(ctx context.Context, history *[]Event, renderedHistory *[]provider.ChatMessage, caps provider.Capabilities) bool {
+	if ctx.Err() != nil || r.Queue == nil {
+		return false
+	}
+	prompts := r.Queue()
+	if len(prompts) == 0 {
+		return false
+	}
+	for _, prompt := range prompts {
+		r.appendUserMessage(ctx, history, renderedHistory, prompt, caps)
+	}
+	return true
+}
+
 func (r Runner) appendUserMessage(ctx context.Context, history *[]Event, renderedHistory *[]provider.ChatMessage, msg string, caps provider.Capabilities) {
 	var content any = msg
 	if r.TransformUserPrompt != nil {
@@ -409,6 +523,10 @@ func (r Runner) appendUserMessage(ctx context.Context, history *[]Event, rendere
 
 func (r Runner) executeOneTool(ctx context.Context, tc ToolCall) any {
 	if err := ctx.Err(); err != nil {
+		if IsTurnInterrupted(ctx) {
+			r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Text: "tool skipped (turn steered)\n", Done: true})
+			return "tool skipped: turn interrupted by user steer before execution"
+		}
 		r.emitToolOutput(ToolOutput{ToolCallID: tc.ID, Text: "turn cancelled\n", Done: true})
 		return "turn cancelled"
 	}
@@ -451,11 +569,17 @@ func (r Runner) RunSingleTurn(ctx context.Context, req provider.ChatRequest, ear
 		if attemptErr == nil {
 			return result.content, result.reasoning, result.reasoningDetails, result.providerMeta, result.toolCalls, result.totalTokens, nil
 		}
+		if IsTurnInterrupted(ctx) {
+			return result.content, result.reasoning, result.reasoningDetails, result.providerMeta, result.toolCalls, result.totalTokens, ErrTurnInterrupted
+		}
 		if !retrySafe {
 			return "", "", nil, nil, nil, 0, attemptErr
 		}
 		retry, retryErr := r.retryTurnAfter(ctx, attemptErr, &retryState)
 		if !retry {
+			if IsTurnInterrupted(ctx) {
+				return "", "", nil, nil, nil, 0, ErrTurnInterrupted
+			}
 			return "", "", nil, nil, nil, 0, retryErr
 		}
 	}
@@ -464,6 +588,9 @@ func (r Runner) RunSingleTurn(ctx context.Context, req provider.ChatRequest, ear
 func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (singleTurnResult, bool, error) {
 	stream, err := r.Provider.StreamChat(ctx, req)
 	if err != nil {
+		if IsTurnInterrupted(ctx) {
+			return singleTurnResult{}, false, ErrTurnInterrupted
+		}
 		return singleTurnResult{}, true, err
 	}
 	defer stream.Close()
@@ -489,6 +616,7 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 	var execMu sync.Mutex
 	execResults := map[int]any{}
 	execStarted := map[int]bool{}
+	execCalls := map[int]ToolCall{}
 	execCh := make(chan execItem, 16)
 	streamDone := make(chan struct{})
 	execClosed := false
@@ -523,20 +651,30 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 			return
 		}
 		execStarted[idx] = true
+		execCalls[idx] = tc
 		execMu.Unlock()
 		execCh <- execItem{idx: idx, tc: tc}
 	}
 
 	lastSeenDeltaIndex := -1
+	streamInterrupted := false
 
 	for {
 		if err := ctx.Err(); err != nil {
+			if IsTurnInterrupted(ctx) {
+				streamInterrupted = true
+				break
+			}
 			return singleTurnResult{}, retrySafe, err
 		}
 
 		ev, recvErr := stream.Recv()
 		if recvErr != nil {
 			if errors.Is(recvErr, io.EOF) {
+				break
+			}
+			if IsTurnInterrupted(ctx) {
+				streamInterrupted = true
 				break
 			}
 			return singleTurnResult{}, retrySafe, recvErr
@@ -640,6 +778,10 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 		}
 	}
 
+	if streamInterrupted {
+		_ = stream.Close()
+	}
+
 	if len(toolCallBuilders) > 0 {
 		type keyedTool struct {
 			index int
@@ -664,12 +806,14 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 			return sorted[i].index < sorted[j].index
 		})
 
-		for _, kt := range sorted {
-			execMu.Lock()
-			alreadyStarted := execStarted[kt.index]
-			execMu.Unlock()
-			if !alreadyStarted && kt.tc.Name != "" {
-				tryExec(kt.index, kt.tc)
+		if !streamInterrupted {
+			for _, kt := range sorted {
+				execMu.Lock()
+				alreadyStarted := execStarted[kt.index]
+				execMu.Unlock()
+				if !alreadyStarted && kt.tc.Name != "" {
+					tryExec(kt.index, kt.tc)
+				}
 			}
 		}
 
@@ -677,10 +821,14 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 
 		execMu.Lock()
 		for _, kt := range sorted {
-			if kt.tc.Name == "" {
+			if kt.tc.Name == "" || (streamInterrupted && !execStarted[kt.index]) {
 				continue
 			}
-			toolCalls = append(toolCalls, kt.tc)
+			call := kt.tc
+			if startedCall, ok := execCalls[kt.index]; ok {
+				call = startedCall
+			}
+			toolCalls = append(toolCalls, call)
 			if earlyResults != nil {
 				*earlyResults = append(*earlyResults, execResults[kt.index])
 			}
@@ -690,14 +838,19 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 		finishExec()
 	}
 
-	return singleTurnResult{
+	res := singleTurnResult{
 		content:          assistantText,
 		reasoning:        reasoningText,
 		reasoningDetails: details,
 		providerMeta:     meta,
 		toolCalls:        toolCalls,
 		totalTokens:      lastTotalTokens,
-	}, retrySafe, nil
+	}
+	if streamInterrupted || IsTurnInterrupted(ctx) {
+		res = sanitizeInterruptedTurn(res, !streamInterrupted)
+		return res, false, ErrTurnInterrupted
+	}
+	return res, retrySafe, nil
 }
 
 func (r Runner) emitRetry(status RetryStatus) {

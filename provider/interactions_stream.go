@@ -488,6 +488,7 @@ func (s *interactionsStream) stopStep(index int) {
 		if step.signature != "" {
 			s.thoughts = append(s.thoughts, map[string]any{"type": "thought", "signature": step.signature})
 			step.signature = ""
+			s.emit(StreamEvent{ProviderMeta: map[string]any{InteractionsThoughtsMetaKey: CopyReasoningDetails(s.thoughts)}})
 		}
 	}
 }

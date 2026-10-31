@@ -124,6 +124,8 @@ type Runner struct {
 	PromptCacheEnabled   bool
 	PipelinedTools       bool
 	Steer                func() []string
+	Queue                func() []string
+	AwaitInterrupt       func(ctx context.Context) bool
 	InternalMessages     func() []string
 	// InternalContext registers the sections of volatile context (date, cwd,
 	// uploads, ...) sent as <internal_context> messages instead of in the
