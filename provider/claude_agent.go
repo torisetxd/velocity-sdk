@@ -127,6 +127,9 @@ func claudeAgentArgs(req ChatRequest, systemPrompt string, tools *claudeAgentToo
 	if model := strings.TrimSpace(req.Model); model != "" {
 		args = append(args, "--model", model)
 	}
+	if effort := claudeAgentEffort(req.ExtraBody); effort != "" {
+		args = append(args, "--effort", effort)
+	}
 
 	systemFile := ""
 	if strings.TrimSpace(systemPrompt) != "" {
@@ -157,6 +160,14 @@ func claudeAgentArgs(req ChatRequest, systemPrompt string, tools *claudeAgentToo
 		}
 	}
 	return args, systemFile, nil
+}
+
+// claudeAgentEffort reads the reasoning effort from the request body. Claude
+// Code takes it as a session flag, and every run here is a fresh session, so a
+// host can switch effort between turns without disturbing anything cached.
+func claudeAgentEffort(extraBody map[string]any) string {
+	effort, _ := extraBody["effort"].(string)
+	return strings.TrimSpace(effort)
 }
 
 // claudeAgentEnv drops the variables Claude Code uses to detect that it is
