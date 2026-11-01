@@ -22,6 +22,7 @@ const (
 	TypeKimi             = "kimi"
 	TypeGemini           = "gemini"
 	TypeVertex           = "vertex"
+	TypeClaudeAgent      = "claude-agent"
 
 	DefaultOpenAICompatibleURL = "http://localhost:8787/chat/completions"
 	DefaultOpenRouterURL       = "https://openrouter.ai/api/v1/chat/completions"
@@ -218,6 +219,9 @@ func registerBuiltins(registry *Registry) {
 			TokenSource: tokenSource,
 		}), nil
 	}, "vertex-ai", "vertex-interactions")
+	mustRegister(registry, TypeClaudeAgent, func(config Config) (Client, error) {
+		return provider.NewClaudeAgentProvider(provider.ClaudeAgentOptions{Command: config.Command}), nil
+	}, "claude")
 }
 
 func mustRegister(registry *Registry, providerType string, factory Factory, aliases ...string) {

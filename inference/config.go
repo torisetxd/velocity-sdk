@@ -16,6 +16,7 @@ type Config struct {
 	Project                 string               `yaml:"project" json:"project"`
 	Location                string               `yaml:"location" json:"location"`
 	Credentials             string               `yaml:"credentials" json:"credentials"`
+	Command                 string               `yaml:"command" json:"command"`
 	TokenSource             provider.TokenSource `yaml:"-" json:"-"`
 }
 
@@ -27,6 +28,7 @@ func (c Config) Normalized() Config {
 	c.Project = strings.TrimSpace(c.Project)
 	c.Location = strings.TrimSpace(c.Location)
 	c.Credentials = strings.TrimSpace(c.Credentials)
+	c.Command = strings.TrimSpace(c.Command)
 	c.ExtraBody = provider.CopyMapAny(c.ExtraBody)
 	return c
 }
