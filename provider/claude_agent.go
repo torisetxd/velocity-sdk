@@ -47,6 +47,30 @@ func (p *claudeAgentProvider) Capabilities() Capabilities {
 
 func (p *claudeAgentProvider) StreamChat(ctx context.Context, req ChatRequest) (ChatStream, error) {
 	systemPrompt, prompt := claudeAgentPrompt(req.Messages)
+
+	var transcript *claudeTranscript
+	if path := claudeTranscriptFromContext(ctx); path != "" {
+		system, prior, tail := claudeAgentSplit(req.Messages)
+		if strings.TrimSpace(tail) == "" {
+			return nil, fmt.Errorf("claude agent: prompt is empty")
+		}
+		systemPrompt, prompt = system, tail
+		var err error
+		transcript, err = openClaudeTranscript(path, prior)
+		if err != nil {
+			return nil, err
+		}
+		if !transcript.resumed {
+			if err := transcript.seed(prior); err != nil {
+				return nil, err
+			}
+		}
+		// The prompt itself never comes back on the stream, so record it here and
+		// let the run append the assistant side.
+		if err := transcript.appendPrompt(prompt); err != nil {
+			return nil, err
+		}
+	}
 	if strings.TrimSpace(prompt) == "" {
 		return nil, fmt.Errorf("claude agent: prompt is empty")
 	}
@@ -58,7 +82,7 @@ func (p *claudeAgentProvider) StreamChat(ctx context.Context, req ChatRequest) (
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	stream := &claudeAgentStream{events: make(chan StreamEvent, 64), cancel: cancel}
+	stream := &claudeAgentStream{events: make(chan StreamEvent, 64), cancel: cancel, transcript: transcript}
 
 	if len(definitions) > 0 && bridge.Execute != nil {
 		tools, err := startClaudeAgentTools(runCtx, definitions, bridge.Execute)
@@ -69,7 +93,7 @@ func (p *claudeAgentProvider) StreamChat(ctx context.Context, req ChatRequest) (
 		stream.tools = tools
 	}
 
-	args, systemFile, err := claudeAgentArgs(req, systemPrompt, stream.tools, definitions)
+	args, systemFile, err := claudeAgentArgs(req, systemPrompt, stream.tools, definitions, transcript)
 	if err != nil {
 		stream.Close()
 		return nil, err
@@ -114,15 +138,19 @@ func (p *claudeAgentProvider) StreamChat(ctx context.Context, req ChatRequest) (
 // claudeAgentArgs builds the print-mode invocation. Built-in Claude Code tools,
 // settings, hooks and foreign MCP servers are all switched off, so the only
 // tools the model can reach are the host's, served over the local MCP bridge.
-func claudeAgentArgs(req ChatRequest, systemPrompt string, tools *claudeAgentTools, definitions []ToolDef) ([]string, string, error) {
+func claudeAgentArgs(req ChatRequest, systemPrompt string, tools *claudeAgentTools, definitions []ToolDef, transcript *claudeTranscript) ([]string, string, error) {
 	args := []string{
 		"--print",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--include-partial-messages",
-		"--no-session-persistence",
 		"--setting-sources", "",
 		"--tools", "",
+	}
+	if transcript == nil {
+		args = append(args, "--no-session-persistence")
+	} else if transcript.resumed {
+		args = append(args, "--resume", transcript.path)
 	}
 	if model := strings.TrimSpace(req.Model); model != "" {
 		args = append(args, "--model", model)
@@ -192,53 +220,56 @@ func claudeAgentEnv() []string {
 	return out
 }
 
-// claudeAgentPrompt splits the chat history into a system prompt and a single
-// print-mode prompt. The trailing user turn becomes the prompt itself; earlier
-// turns are replayed as a transcript because every run starts a fresh session.
-func claudeAgentPrompt(messages []ChatMessage) (string, string) {
+// claudeAgentSplit separates the system prompt, every turn before the trailing
+// user message, and that trailing message. Without a stored Claude Code session
+// the earlier turns are replayed as text; with one they are already on disk.
+func claudeAgentSplit(messages []ChatMessage) (string, []ChatMessage, string) {
 	system := make([]string, 0, 1)
-	history := make([]string, 0, len(messages))
-	pendingUser := ""
-
-	flushUser := func() {
-		if pendingUser != "" {
-			history = append(history, "USER:\n"+pendingUser)
-			pendingUser = ""
-		}
-	}
-
+	turns := make([]ChatMessage, 0, len(messages))
 	for _, message := range messages {
 		role := strings.ToLower(strings.TrimSpace(message.Role))
-		text := strings.TrimSpace(claudeAgentContent(message.Content))
 		switch role {
 		case "system", "developer":
-			if text != "" {
+			if text := strings.TrimSpace(claudeAgentContent(message.Content)); text != "" {
 				system = append(system, text)
 			}
-		case "user":
-			flushUser()
-			pendingUser = text
 		default:
-			if text == "" {
-				continue
-			}
-			flushUser()
-			history = append(history, strings.ToUpper(role)+":\n"+text)
+			turns = append(turns, message)
 		}
 	}
 
-	if pendingUser != "" {
-		if len(history) == 0 {
-			return strings.Join(system, "\n\n"), pendingUser
+	prior, tail := turns, ""
+	if count := len(turns); count > 0 && strings.EqualFold(strings.TrimSpace(turns[count-1].Role), "user") {
+		tail = strings.TrimSpace(claudeAgentContent(turns[count-1].Content))
+		prior = turns[:count-1]
+	}
+	return strings.Join(system, "\n\n"), prior, tail
+}
+
+// claudeAgentPrompt renders the whole conversation as one print-mode prompt for
+// runs that keep no Claude Code session on disk.
+func claudeAgentPrompt(messages []ChatMessage) (string, string) {
+	system, prior, tail := claudeAgentSplit(messages)
+
+	blocks := make([]string, 0, len(prior))
+	for _, message := range prior {
+		role := strings.ToUpper(strings.TrimSpace(message.Role))
+		text := strings.TrimSpace(claudeAgentContent(message.Content))
+		if role == "" || text == "" {
+			continue
 		}
-		history = append(history, "USER:\n"+pendingUser)
+		blocks = append(blocks, role+":\n"+text)
 	}
 
-	transcript := strings.Join(history, "\n\n")
-	if transcript == "" {
-		return strings.Join(system, "\n\n"), ""
+	transcript := strings.Join(blocks, "\n\n")
+	switch {
+	case transcript == "":
+		return system, tail
+	case tail == "":
+		return system, "Conversation so far:\n\n" + transcript
+	default:
+		return system, "Conversation so far:\n\n" + transcript + "\n\nUSER:\n" + tail
 	}
-	return strings.Join(system, "\n\n"), "Conversation so far:\n\n" + transcript
 }
 
 func claudeAgentContent(content any) string {
@@ -296,6 +327,7 @@ type claudeAgentStream struct {
 	events     chan StreamEvent
 	cmd        *exec.Cmd
 	tools      *claudeAgentTools
+	transcript *claudeTranscript
 	cancel     context.CancelFunc
 	systemFile string
 	stderr     *boundedWriter
@@ -351,7 +383,7 @@ func (s *claudeAgentStream) pump(ctx context.Context, stdout io.Reader) {
 	defer close(s.events)
 	defer s.Close()
 
-	decoder := &claudeAgentDecoder{stream: s, ctx: ctx}
+	decoder := &claudeAgentDecoder{stream: s, ctx: ctx, transcript: s.transcript}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
 	for scanner.Scan() {
@@ -370,6 +402,11 @@ func (s *claudeAgentStream) pump(ctx context.Context, stdout io.Reader) {
 		return
 	}
 	waitErr := s.cmd.Wait()
+	if s.transcript != nil {
+		if err := s.transcript.flush(); err != nil && decoder.sawResult {
+			s.setError(err)
+		}
+	}
 	if decoder.sawResult {
 		return
 	}

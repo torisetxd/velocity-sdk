@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -30,10 +31,15 @@ func (u *claudeAgentUsage) toTokenUsage(cost float64) *TokenUsage {
 }
 
 type claudeAgentEnvelope struct {
-	Type    string          `json:"type"`
-	Subtype string          `json:"subtype"`
-	Event   json.RawMessage `json:"event"`
-	Message json.RawMessage `json:"message"`
+	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype"`
+	Event     json.RawMessage `json:"event"`
+	Message   json.RawMessage `json:"message"`
+	UUID      string          `json:"uuid"`
+	Timestamp string          `json:"timestamp"`
+	SessionID string          `json:"session_id"`
+	Cwd       string          `json:"cwd"`
+	Version   string          `json:"claude_code_version"`
 }
 
 type claudeAgentStreamEvent struct {
@@ -48,6 +54,7 @@ type claudeAgentStreamEvent struct {
 
 type claudeAgentMessage struct {
 	Role    string `json:"role"`
+	Error   string `json:"error"`
 	Content []struct {
 		Type     string `json:"type"`
 		Text     string `json:"text"`
@@ -81,12 +88,13 @@ type claudeAgentRateLimit struct {
 }
 
 type claudeAgentDecoder struct {
-	stream    *claudeAgentStream
-	ctx       context.Context
-	sawResult bool
-	sawDelta  bool
-	emitted   bool
-	rateLimit *claudeAgentRateLimit
+	stream     *claudeAgentStream
+	transcript *claudeTranscript
+	ctx        context.Context
+	sawResult  bool
+	sawDelta   bool
+	emitted    bool
+	rateLimit  *claudeAgentRateLimit
 }
 
 func (d *claudeAgentDecoder) emit(event StreamEvent) bool {
@@ -110,13 +118,51 @@ func (d *claudeAgentDecoder) decodeLine(raw []byte) {
 	switch envelope.Type {
 	case "stream_event":
 		d.decodeStreamEvent(envelope.Event)
-	case "assistant":
-		d.decodeAssistant(envelope.Message)
+	case "system":
+		d.decodeSession(envelope)
+	case "user", "assistant":
+		d.record(envelope)
+		if envelope.Type == "assistant" {
+			d.decodeAssistant(envelope.Message)
+		}
 	case "rate_limit_event":
 		d.decodeRateLimit(envelope.Message, raw)
 	case "result":
 		d.decodeResult(raw)
 	}
+}
+
+// decodeSession captures the identifiers the transcript records need.
+func (d *claudeAgentDecoder) decodeSession(envelope claudeAgentEnvelope) {
+	if d.transcript == nil || envelope.Subtype != "init" {
+		return
+	}
+	d.transcript.cwd = envelope.Cwd
+	d.transcript.version = envelope.Version
+	if d.transcript.session == "" {
+		d.transcript.session = envelope.SessionID
+	}
+}
+
+// record appends the full user and assistant messages to the transcript, so the
+// next run can resume this conversation with its thinking blocks intact.
+func (d *claudeAgentDecoder) record(envelope claudeAgentEnvelope) {
+	transcript := d.transcript
+	if transcript == nil || transcript.session == "" || len(envelope.Message) == 0 {
+		return
+	}
+	// The host already recorded the prompt; a plain text user echo would double it.
+	if envelope.Type == "user" && !claudeMessageHasToolResult(envelope.Message) {
+		return
+	}
+	if transcript.seen(envelope.UUID) {
+		return
+	}
+	line, err := transcript.append(envelope.Type, envelope.Message, envelope.UUID, envelope.Timestamp)
+	if err != nil {
+		return
+	}
+	_ = transcript.write(line)
 }
 
 func (d *claudeAgentDecoder) decodeStreamEvent(raw json.RawMessage) {
@@ -166,6 +212,9 @@ func (d *claudeAgentDecoder) decodeAssistant(raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &message); err != nil {
 		return
 	}
+	if message.Error != "" {
+		return
+	}
 	for _, block := range message.Content {
 		switch block.Type {
 		case "text":
@@ -203,7 +252,7 @@ func (d *claudeAgentDecoder) decodeResult(raw []byte) {
 	}
 
 	text := strings.TrimSpace(result.Result)
-	if text != "" && !d.emitted {
+	if text != "" && !d.emitted && !result.IsError {
 		d.emitted = true
 		d.emit(StreamEvent{Content: text})
 	}
@@ -231,10 +280,52 @@ func (d *claudeAgentDecoder) decodeResult(raw []byte) {
 	if message == "" {
 		message = "run failed (" + result.Subtype + ")"
 	}
-	if reset := d.resetNote(); reset != "" {
-		message += " (" + reset + ")"
+	if note := d.resetNote(); note != "" {
+		message += " (" + note + ")"
 	}
-	d.stream.setError(fmt.Errorf("claude agent: %s", message))
+	d.stream.setError(d.failure(message, result))
+}
+
+// failure maps the run's error onto the error types hosts already understand, so
+// rate limits and overloads retry instead of looking like programming errors.
+func (d *claudeAgentDecoder) failure(message string, result claudeAgentResult) error {
+	lower := strings.ToLower(message + " " + result.APIError)
+	switch {
+	case result.APIErrorStatus == http.StatusTooManyRequests,
+		result.APIError == "usage_limit_reached",
+		strings.Contains(lower, "rate limit"),
+		strings.Contains(lower, "usage limit"),
+		strings.Contains(lower, "hit your limit"):
+		return &RateLimitError{
+			StatusCode: http.StatusTooManyRequests,
+			RetryAfter: d.retryAfter(),
+			Message:    "claude agent: " + message,
+		}
+	case result.APIErrorStatus >= http.StatusInternalServerError,
+		result.APIError == "server_error",
+		strings.Contains(lower, "overloaded"),
+		strings.Contains(lower, "server error"),
+		strings.Contains(lower, "internal error"):
+		status := result.APIErrorStatus
+		if status < http.StatusInternalServerError {
+			status = http.StatusServiceUnavailable
+		}
+		return &ServerError{StatusCode: status, Message: "claude agent: " + message}
+	default:
+		return fmt.Errorf("claude agent: %s", message)
+	}
+}
+
+// retryAfter reports how long the reported limit still lasts, in seconds.
+func (d *claudeAgentDecoder) retryAfter() int {
+	if d.rateLimit == nil || d.rateLimit.ResetsAt == 0 {
+		return 0
+	}
+	remaining := time.Until(time.Unix(d.rateLimit.ResetsAt, 0))
+	if remaining <= 0 {
+		return 0
+	}
+	return int(remaining.Seconds())
 }
 
 func (d *claudeAgentDecoder) resetNote() string {
