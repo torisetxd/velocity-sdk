@@ -46,7 +46,42 @@ func (r Runner) effectiveMaxServerErrorRetries() int {
 	return defaultMaxRetries
 }
 
-func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runErr error) {
+// Run drives the model until it has nothing left to do. Every assistant event
+// it adds carries its Timing, and the last one also records the length of the
+// whole run.
+func (r Runner) Run(ctx context.Context, sess Session) (TurnResult, error) {
+	start := time.Now()
+	result, err := r.run(ctx, sess)
+	stampRunTime(result.History, start)
+	return result, err
+}
+
+func stepTiming(t Timing, start time.Time) *Timing {
+	t.Wall = time.Since(start).Milliseconds()
+	if t == (Timing{}) {
+		return nil
+	}
+	return &t
+}
+
+func stampRunTime(history []Event, start time.Time) {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Kind != EventKindAssistant {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, history[i].OccurredAt)
+		if err != nil || at.Before(start) {
+			return
+		}
+		if history[i].Timing == nil {
+			history[i].Timing = &Timing{}
+		}
+		history[i].Timing.Run = time.Since(start).Milliseconds()
+		return
+	}
+}
+
+func (r Runner) run(ctx context.Context, sess Session) (result TurnResult, runErr error) {
 	if r.Provider == nil {
 		return TurnResult{}, fmt.Errorf("provider is required")
 	}
@@ -121,7 +156,9 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 		}
 
 		var toolResults []any
-		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, err := r.RunSingleTurn(turnCtx, req, &toolResults)
+		turnStart := time.Now()
+		turn, err := r.runTurn(turnCtx, req, &toolResults)
+		assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens := turn.content, turn.reasoning, turn.reasoningDetails, turn.providerMeta, turn.toolCalls, turn.totalTokens
 		interrupted := IsTurnInterrupted(turnCtx)
 		if err != nil && !interrupted {
 			cleanupTurn()
@@ -207,7 +244,10 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 
 				toolResults = nil
 				var emptyRetryErr error
-				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens, emptyRetryErr = r.RunSingleTurn(turnCtx, req, &toolResults)
+				var emptyRetryTurn singleTurnResult
+				emptyRetryTurn, emptyRetryErr = r.runTurn(turnCtx, req, &toolResults)
+				turn = emptyRetryTurn
+				assistantText, reasoningText, reasoningDetails, providerMeta, toolCalls, tokens = turn.content, turn.reasoning, turn.reasoningDetails, turn.providerMeta, turn.toolCalls, turn.totalTokens
 				if IsTurnInterrupted(turnCtx) {
 					clearEmptyRetry()
 					interrupted = true
@@ -283,7 +323,8 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 					turnTokens = tokens
 				}
 				assistantEvent := AssistantEvent(assistantText, reasoningText, reasoningDetails, toolCalls, turnTokens)
-				assistantEvent.OccurredAt = time.Now().UTC().Format(time.RFC3339Nano)
+				assistantEvent.OccurredAt = vcontext.Now()
+				assistantEvent.Timing = stepTiming(turn.timing, turnStart)
 				model := r.Model
 				assistantEvent.Model = &model
 				assistantEvent.ProviderMeta = provider.CopyMapAny(providerMeta)
@@ -325,7 +366,8 @@ func (r Runner) Run(ctx context.Context, sess Session) (result TurnResult, runEr
 			turnTokens = tokens
 		}
 		assistantEvent := AssistantEvent(assistantText, reasoningText, reasoningDetails, toolCalls, turnTokens)
-		assistantEvent.OccurredAt = time.Now().UTC().Format(time.RFC3339Nano)
+		assistantEvent.OccurredAt = vcontext.Now()
+		assistantEvent.Timing = stepTiming(turn.timing, turnStart)
 		model := r.Model
 		assistantEvent.Model = &model
 		assistantEvent.ProviderMeta = provider.CopyMapAny(providerMeta)
@@ -562,9 +604,15 @@ type singleTurnResult struct {
 	providerMeta     map[string]any
 	toolCalls        []ToolCall
 	totalTokens      int
+	timing           Timing
 }
 
 func (r Runner) RunSingleTurn(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (content string, reasoning string, reasoningDetails []map[string]any, providerMeta map[string]any, toolCalls []ToolCall, totalTokens int, err error) {
+	result, err := r.runTurn(ctx, req, earlyResults)
+	return result.content, result.reasoning, result.reasoningDetails, result.providerMeta, result.toolCalls, result.totalTokens, err
+}
+
+func (r Runner) runTurn(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (singleTurnResult, error) {
 	retryState := turnRetryState{}
 	defer func() {
 		r.finishTurnRetry(retryState)
@@ -572,25 +620,70 @@ func (r Runner) RunSingleTurn(ctx context.Context, req provider.ChatRequest, ear
 	for {
 		result, retrySafe, attemptErr := r.runSingleTurnAttempt(ctx, req, earlyResults)
 		if attemptErr == nil {
-			return result.content, result.reasoning, result.reasoningDetails, result.providerMeta, result.toolCalls, result.totalTokens, nil
+			return result, nil
 		}
 		if IsTurnInterrupted(ctx) {
-			return result.content, result.reasoning, result.reasoningDetails, result.providerMeta, result.toolCalls, result.totalTokens, ErrTurnInterrupted
+			return result, ErrTurnInterrupted
 		}
 		if !retrySafe {
-			return "", "", nil, nil, nil, 0, attemptErr
+			return singleTurnResult{}, attemptErr
 		}
 		retry, retryErr := r.retryTurnAfter(ctx, attemptErr, &retryState)
 		if !retry {
 			if IsTurnInterrupted(ctx) {
-				return "", "", nil, nil, nil, 0, ErrTurnInterrupted
+				return singleTurnResult{}, ErrTurnInterrupted
 			}
-			return "", "", nil, nil, nil, 0, retryErr
+			return singleTurnResult{}, retryErr
 		}
 	}
 }
 
+// streamClock notes when a response stream first produced each kind of token.
+type streamClock struct {
+	start      time.Time
+	first      time.Time
+	reasoning  time.Time
+	output     time.Time
+	toolsTotal time.Duration
+}
+
+func (c *streamClock) observe(reasoning, output bool) {
+	if !reasoning && !output {
+		return
+	}
+	now := time.Now()
+	if c.first.IsZero() {
+		c.first = now
+	}
+	if reasoning && c.reasoning.IsZero() {
+		c.reasoning = now
+	}
+	if output && c.output.IsZero() {
+		c.output = now
+	}
+}
+
+func (c *streamClock) timing(end time.Time) Timing {
+	var t Timing
+	if !c.first.IsZero() {
+		t.API = c.first.Sub(c.start).Milliseconds()
+	}
+	if !c.reasoning.IsZero() {
+		stop := end
+		if !c.output.IsZero() {
+			stop = c.output
+		}
+		t.Reasoning = stop.Sub(c.reasoning).Milliseconds()
+	}
+	if !c.output.IsZero() {
+		t.Output = end.Sub(c.output).Milliseconds()
+	}
+	t.Tools = c.toolsTotal.Milliseconds()
+	return t
+}
+
 func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatRequest, earlyResults *[]any) (singleTurnResult, bool, error) {
+	clock := &streamClock{start: time.Now()}
 	stream, err := r.Provider.StreamChat(ctx, req)
 	if err != nil {
 		if IsTurnInterrupted(ctx) {
@@ -629,8 +722,10 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 	go func() {
 		for item := range execCh {
 			r.emitToolCall(item.tc)
+			toolStart := time.Now()
 			result := r.executeOneTool(ctx, item.tc)
 			execMu.Lock()
+			clock.toolsTotal += time.Since(toolStart)
 			execResults[item.idx] = result
 			execMu.Unlock()
 		}
@@ -684,6 +779,8 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 			}
 			return singleTurnResult{}, retrySafe, recvErr
 		}
+
+		clock.observe(ev.Reasoning != "", ev.Content != "" || len(ev.ToolCallDeltas) > 0)
 
 		if ev.TotalTokens > 0 {
 			lastTotalTokens = ev.TotalTokens
@@ -783,6 +880,7 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 		}
 	}
 
+	streamEnd := time.Now()
 	if streamInterrupted {
 		_ = stream.Close()
 	}
@@ -851,6 +949,9 @@ func (r Runner) runSingleTurnAttempt(ctx context.Context, req provider.ChatReque
 		toolCalls:        toolCalls,
 		totalTokens:      lastTotalTokens,
 	}
+	execMu.Lock()
+	res.timing = clock.timing(streamEnd)
+	execMu.Unlock()
 	if streamInterrupted || IsTurnInterrupted(ctx) {
 		res = sanitizeInterruptedTurn(res, !streamInterrupted)
 		return res, false, ErrTurnInterrupted

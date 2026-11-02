@@ -2,6 +2,7 @@ package context
 
 import (
 	stdctx "context"
+	"time"
 
 	"velocitylabs.cc/sdk"
 	"velocitylabs.cc/sdk/provider"
@@ -37,6 +38,37 @@ type GoalState struct {
 	Blocker    string `json:"blocker,omitempty"`
 }
 
+// Timing is where one assistant step spent its time, in milliseconds. A step
+// is one model request plus the tool calls it made. Reasoning, Output and the
+// stream part of API come from the response stream, so they are measured for
+// every provider that streams.
+type Timing struct {
+	// Wall is the whole step: request sent until its tool calls finished.
+	Wall int64 `json:"wall_ms,omitempty"`
+	// API is the wait from sending the request to the first streamed token.
+	API int64 `json:"api_ms,omitempty"`
+	// Reasoning is how long reasoning streamed, from the first reasoning token
+	// until the answer or a tool call began. Providers that only return a
+	// finished reasoning summary report their wait under API.
+	Reasoning int64 `json:"reasoning_ms,omitempty"`
+	// Output is how long the answer and tool calls streamed.
+	Output int64 `json:"output_ms,omitempty"`
+	// Tools is the time spent executing the step's tool calls. Tools run while
+	// later calls are still streaming, so this overlaps Output; Wall is the
+	// true elapsed time.
+	Tools int64 `json:"tools_ms,omitempty"`
+	// Run is the length of the whole Run, set only on the last assistant event
+	// the run produced.
+	Run int64 `json:"run_ms,omitempty"`
+}
+
+func (t Timing) Thinking() time.Duration {
+	if t.Reasoning <= 0 {
+		return 0
+	}
+	return time.Duration(t.API+t.Reasoning) * time.Millisecond
+}
+
 type Event struct {
 	Kind             EventKind        `json:"kind"`
 	OccurredAt       string           `json:"occurred_at,omitempty"`
@@ -50,6 +82,7 @@ type Event struct {
 	TotalTokens      int              `json:"total_tokens,omitempty"`
 	CompressionData  *CompressionData `json:"compression,omitempty"`
 	Goal             *GoalState       `json:"goal,omitempty"`
+	Timing           *Timing          `json:"timing,omitempty"`
 }
 
 type RetainedFile struct {
@@ -114,21 +147,27 @@ func GoalFromHistory(history []Event) *GoalState {
 	return nil
 }
 
+// Now is the current time in the format Event.OccurredAt uses.
+func Now() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
 func UserEvent(content any) Event {
-	return Event{Kind: EventKindUser, Content: CloneAny(content)}
+	return Event{Kind: EventKindUser, OccurredAt: Now(), Content: CloneAny(content)}
 }
 
 func SystemEvent(content any) Event {
-	return Event{Kind: EventKindSystem, Content: CloneAny(content)}
+	return Event{Kind: EventKindSystem, OccurredAt: Now(), Content: CloneAny(content)}
 }
 
 func InternalEvent(content any) Event {
-	return Event{Kind: EventKindInternal, Content: CloneAny(content)}
+	return Event{Kind: EventKindInternal, OccurredAt: Now(), Content: CloneAny(content)}
 }
 
 func AssistantEvent(content any, reasoning string, reasoningDetails []map[string]any, toolCalls []ToolCall, totalTokens int) Event {
 	return Event{
 		Kind:             EventKindAssistant,
+		OccurredAt:       Now(),
 		Content:          CloneAny(content),
 		Reasoning:        reasoning,
 		ReasoningDetails: provider.CopyReasoningDetails(reasoningDetails),
@@ -167,13 +206,14 @@ func ProviderCapabilities(p provider.Provider) provider.Capabilities {
 func ToolResultEvent(toolCallID string, content any) Event {
 	return Event{
 		Kind:       EventKindTool,
+		OccurredAt: Now(),
 		ToolCallID: toolCallID,
 		Content:    normalizeToolContent(content),
 	}
 }
 
 func CompressionBoundaryEvent(content any) Event {
-	return Event{Kind: EventKindCompressionBoundary, Content: CloneAny(content)}
+	return Event{Kind: EventKindCompressionBoundary, OccurredAt: Now(), Content: CloneAny(content)}
 }
 
 func CompressionBoundaryEventWithData(summary, transcript string) Event {
@@ -182,8 +222,9 @@ func CompressionBoundaryEventWithData(summary, transcript string) Event {
 
 func CompressionBoundaryEventWithFiles(summary, transcript string, retainedFiles []RetainedFile) Event {
 	return Event{
-		Kind:    EventKindCompressionBoundary,
-		Content: summary,
+		Kind:       EventKindCompressionBoundary,
+		OccurredAt: Now(),
+		Content:    summary,
 		CompressionData: &CompressionData{
 			Summary:       summary,
 			Transcript:    transcript,
@@ -224,6 +265,10 @@ func CloneEvents(events []Event) []Event {
 			TotalTokens:      ev.TotalTokens,
 			CompressionData:  CloneCompressionData(ev.CompressionData),
 			Goal:             CloneGoal(ev.Goal),
+		}
+		if ev.Timing != nil {
+			timing := *ev.Timing
+			out[i].Timing = &timing
 		}
 		if ev.Model != nil {
 			model := *ev.Model

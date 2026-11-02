@@ -40,6 +40,10 @@ func EventsFromProviderMessages(messages []provider.ChatMessage) []Event {
 			out = append(out, ToolResultEvent(msg.ToolCallID, CloneAny(msg.Content)))
 		}
 	}
+	// Chat messages carry no times, so these events must not claim to be new.
+	for i := range out {
+		out[i].OccurredAt = ""
+	}
 	return out
 }
 

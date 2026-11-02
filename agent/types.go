@@ -22,6 +22,7 @@ type ModelRef = vcontext.ModelRef
 type ToolCall = vcontext.ToolCall
 type GoalState = vcontext.GoalState
 type Event = vcontext.Event
+type Timing = vcontext.Timing
 type RetainedFile = vcontext.RetainedFile
 type CompressionData = vcontext.CompressionData
 type Session = vcontext.Session
