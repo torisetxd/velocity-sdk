@@ -23,6 +23,7 @@ const (
 	TypeGemini           = "gemini"
 	TypeVertex           = "vertex"
 	TypeClaudeAgent      = "claude-agent"
+	TypeAnthropic        = "anthropic"
 
 	DefaultOpenAICompatibleURL = "http://localhost:8787/chat/completions"
 	DefaultOpenRouterURL       = "https://openrouter.ai/api/v1/chat/completions"
@@ -33,6 +34,7 @@ const (
 	DefaultClineURL            = "https://api.cline.bot/api/v1/chat/completions"
 	DefaultKimiURL             = "https://api.kimi.com/coding/v1/chat/completions"
 	DefaultGeminiURL           = "https://generativelanguage.googleapis.com/v1beta"
+	DefaultAnthropicURL        = provider.DefaultAnthropicURL
 )
 
 var (
@@ -83,6 +85,8 @@ func DetectType(rawType, apiURL string) string {
 		return TypeGemini
 	case strings.Contains(lowerURL, "aiplatform.googleapis.com"):
 		return TypeVertex
+	case strings.Contains(lowerURL, "api.anthropic.com"):
+		return TypeAnthropic
 	case strings.HasSuffix(strings.TrimRight(lowerURL, "/"), "/responses"):
 		return TypeResponses
 	default:
@@ -108,6 +112,8 @@ func DefaultURLForType(providerType string) string {
 		return DefaultKimiURL
 	case TypeGemini:
 		return DefaultGeminiURL
+	case TypeAnthropic:
+		return DefaultAnthropicURL
 	case TypeVertex:
 		// derived from the project's location, see provider.InteractionsConfig
 		return ""
@@ -219,6 +225,14 @@ func registerBuiltins(registry *Registry) {
 			TokenSource: tokenSource,
 		}), nil
 	}, "vertex-ai", "vertex-interactions")
+	mustRegister(registry, TypeAnthropic, func(config Config) (Client, error) {
+		return provider.NewAnthropicProvider(provider.AnthropicConfig{
+			APIURL:      config.APIURL,
+			APIKey:      config.APIKey,
+			ExtraBody:   config.ExtraBody,
+			TokenSource: config.TokenSource,
+		}), nil
+	}, "anthropic-messages")
 	mustRegister(registry, TypeClaudeAgent, func(config Config) (Client, error) {
 		return provider.NewClaudeAgentProvider(provider.ClaudeAgentOptions{Command: config.Command}), nil
 	}, "claude")
