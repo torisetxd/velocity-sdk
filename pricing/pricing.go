@@ -41,6 +41,17 @@ type Model struct {
 	CacheRead     float64
 	CacheWrite    float64
 	Tiers         []Tier
+	// Name is the catalog's human-readable label ("Claude Sonnet 4.5"); empty
+	// when the catalog publishes none.
+	Name string
+}
+
+// DisplayName returns the catalog label, falling back to the model ID.
+func (m Model) DisplayName() string {
+	if strings.TrimSpace(m.Name) != "" {
+		return m.Name
+	}
+	return m.ID
 }
 
 // Priced reports whether the entry carries any price.
@@ -86,6 +97,7 @@ type rawCost struct {
 
 type rawModel struct {
 	ID    string   `json:"id"`
+	Name  string   `json:"name"`
 	Cost  *rawCost `json:"cost"`
 	Limit struct {
 		Context int `json:"context"`
@@ -119,7 +131,7 @@ func Parse(data []byte) (*Catalog, error) {
 			if id == "" {
 				id = key
 			}
-			m := Model{ID: id, Provider: pid, ContextWindow: rm.Limit.Context, MaxOutput: rm.Limit.Output}
+			m := Model{ID: id, Name: strings.TrimSpace(rm.Name), Provider: pid, ContextWindow: rm.Limit.Context, MaxOutput: rm.Limit.Output}
 			if rm.Cost != nil {
 				m.Input, m.Output, m.CacheRead, m.CacheWrite = rm.Cost.Input, rm.Cost.Output, rm.Cost.CacheRead, rm.Cost.CacheWrite
 				for _, t := range rm.Cost.Tiers {
