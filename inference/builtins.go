@@ -83,7 +83,7 @@ func DetectType(rawType, apiURL string) string {
 		return TypeCline
 	case strings.Contains(lowerURL, "api.kimi.com/coding"), strings.Contains(lowerURL, "api.kimi.ai/coding"):
 		return TypeKimi
-	case strings.Contains(lowerURL, "qwencloud.com"):
+	case strings.Contains(lowerURL, "qwencloudapi.com"), strings.Contains(lowerURL, "qwencloud.com"):
 		return TypeQwenTokenPlan
 	case strings.Contains(lowerURL, "generativelanguage.googleapis.com"):
 		return TypeGemini

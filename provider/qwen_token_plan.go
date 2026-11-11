@@ -14,7 +14,7 @@ const (
 	QwenTokenPlanAPIKeyEnv = "QWEN_TP_API_KEY"
 	// DefaultQwenTokenPlanURL is the OpenAI-compatible base URL of the Qwen
 	// Cloud token plan.
-	DefaultQwenTokenPlanURL = "https://token-plan.maas.qwencloud.com/compatible-mode/v1"
+	DefaultQwenTokenPlanURL = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
 )
 
 const (
