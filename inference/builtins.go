@@ -20,6 +20,7 @@ const (
 	TypeZen              = "zen"
 	TypeCline            = "cline"
 	TypeKimi             = "kimi"
+	TypeQwenTokenPlan    = "qwen-token-plan"
 	TypeGemini           = "gemini"
 	TypeVertex           = "vertex"
 	TypeClaudeAgent      = "claude-agent"
@@ -33,6 +34,7 @@ const (
 	DefaultZenURL              = "https://opencode.ai/zen/v1/chat/completions"
 	DefaultClineURL            = "https://api.cline.bot/api/v1/chat/completions"
 	DefaultKimiURL             = "https://api.kimi.com/coding/v1/chat/completions"
+	DefaultQwenTokenPlanURL    = provider.DefaultQwenTokenPlanURL
 	DefaultGeminiURL           = "https://generativelanguage.googleapis.com/v1beta"
 	DefaultAnthropicURL        = provider.DefaultAnthropicURL
 )
@@ -81,6 +83,8 @@ func DetectType(rawType, apiURL string) string {
 		return TypeCline
 	case strings.Contains(lowerURL, "api.kimi.com/coding"), strings.Contains(lowerURL, "api.kimi.ai/coding"):
 		return TypeKimi
+	case strings.Contains(lowerURL, "qwencloud.com"):
+		return TypeQwenTokenPlan
 	case strings.Contains(lowerURL, "generativelanguage.googleapis.com"):
 		return TypeGemini
 	case strings.Contains(lowerURL, "aiplatform.googleapis.com"):
@@ -110,6 +114,8 @@ func DefaultURLForType(providerType string) string {
 		return DefaultClineURL
 	case TypeKimi:
 		return DefaultKimiURL
+	case TypeQwenTokenPlan:
+		return DefaultQwenTokenPlanURL
 	case TypeGemini:
 		return DefaultGeminiURL
 	case TypeAnthropic:
@@ -192,6 +198,12 @@ func registerBuiltins(registry *Registry) {
 		}
 		return provider.NewKimiProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField), nil
 	}, "kimi-code")
+	mustRegister(registry, TypeQwenTokenPlan, func(config Config) (Client, error) {
+		if config.APIURL == "" {
+			config.APIURL = DefaultQwenTokenPlanURL
+		}
+		return provider.NewQwenTokenPlanProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField)
+	})
 	mustRegister(registry, TypeGemini, func(config Config) (Client, error) {
 		return provider.NewInteractionsProvider(provider.InteractionsConfig{
 			APIURL:      config.APIURL,
