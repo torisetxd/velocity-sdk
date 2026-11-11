@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"velocitylabs.cc/sdk/internal/debugtrace"
 )
@@ -572,6 +573,9 @@ func (s *responsesStream) readLoop() {
 		case <-s.stopCh:
 			return
 		}
+		if isSSEDoneLine(lineRaw) {
+			return
+		}
 	}
 }
 
@@ -582,7 +586,10 @@ func (s *responsesStream) Close() error {
 			_ = s.resp.Body.Close()
 		}
 	})
-	<-s.readerDone
+	select {
+	case <-s.readerDone:
+	case <-time.After(streamCloseGrace):
+	}
 	return nil
 }
 

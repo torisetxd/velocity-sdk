@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"velocitylabs.cc/sdk"
 	"velocitylabs.cc/sdk/internal/debugtrace"
@@ -27,6 +28,22 @@ type streamOpts struct {
 type sseLine struct {
 	line string
 	err  error
+}
+
+// streamCloseGrace bounds how long Close waits for the reader goroutine.
+// net/http can park a body read at end-of-body for as long as the peer keeps
+// the connection alive, so waiting for the reader without a bound turns every
+// closed stream into a stall of up to the transport's idle-connection timeout.
+const streamCloseGrace = 2 * time.Second
+
+// isSSEDoneLine reports whether line is the marker that ends an
+// OpenAI-compatible event stream.
+func isSSEDoneLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]"
 }
 
 type openAIStream struct {
@@ -170,6 +187,9 @@ func (s *openAIStream) readLoop() {
 		case <-s.quit:
 			return
 		}
+		if isSSEDoneLine(lineRaw) {
+			return
+		}
 	}
 }
 
@@ -184,7 +204,10 @@ func (s *openAIStream) shutdown() {
 
 func (s *openAIStream) Close() error {
 	s.shutdown()
-	<-s.readerDone
+	select {
+	case <-s.readerDone:
+	case <-time.After(streamCloseGrace):
+	}
 	return nil
 }
 
