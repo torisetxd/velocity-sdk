@@ -46,6 +46,8 @@ type ChatRequest struct {
 	TurnID string `json:"-"`
 	// CodexWindowID, CodexTurnMetadata and CodexParentThreadID are forwarded as
 	// x-codex-* headers on the ChatGPT subscription route when set.
+	CodexAccountID      string `json:"-"`
+	CodexDataResidency  string `json:"-"`
 	CodexWindowID       string `json:"-"`
 	CodexTurnMetadata   string `json:"-"`
 	CodexParentThreadID string `json:"-"`

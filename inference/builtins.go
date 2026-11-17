@@ -14,6 +14,7 @@ const (
 	TypeResponses        = "responses"
 	TypeCopilot          = "copilot"
 	TypeCopilotResponses = "copilot-responses"
+	TypeCodex            = "codex"
 	TypeChatGPT          = "chatgpt"
 	TypeXAI              = "xai"
 	TypeCrof             = "crof"
@@ -102,6 +103,8 @@ func DefaultURLForType(providerType string) string {
 	switch CanonicalType(providerType) {
 	case TypeOpenRouter:
 		return DefaultOpenRouterURL
+	case TypeCodex:
+		return provider.DefaultCodexURL
 	case TypeResponses, TypeChatGPT:
 		return DefaultResponsesURL
 	case TypeXAI:
@@ -168,6 +171,9 @@ func registerBuiltins(registry *Registry) {
 	mustRegister(registry, TypeCopilotResponses, func(config Config) (Client, error) {
 		return provider.NewCopilotResponsesProvider(config.APIURL, config.APIKey, config.ExtraBody), nil
 	}, "copilot_responses")
+	mustRegister(registry, TypeCodex, func(config Config) (Client, error) {
+		return provider.NewCodexProvider(config.APIURL, config.APIKey, config.ExtraBody, config.TokenSource), nil
+	})
 	mustRegister(registry, TypeChatGPT, func(config Config) (Client, error) {
 		return provider.NewChatGPTProvider(config.APIURL, config.APIKey, config.ExtraBody, config.TokenSource), nil
 	})

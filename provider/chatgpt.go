@@ -22,6 +22,7 @@ type chatgptProvider struct {
 	inner    *responsesProvider
 	turns    chatGPTTurnCache
 	warnOnce sync.Once
+	legacy   bool
 }
 
 // NewChatGPTProvider constructs a ChatGPT Responses provider. Requests are
@@ -50,15 +51,31 @@ func (p *chatgptProvider) StreamChat(ctx context.Context, req ChatRequest) (Chat
 	if err != nil {
 		return nil, err
 	}
-	payload, err := enableChatGPTStatelessReasoningPersistence(body)
+	normalize := enableChatGPTStatelessReasoningPersistence
+	if p.legacy {
+		normalize = enableCodexReasoningPersistence
+	}
+	payload, err := normalize(body)
 	if err != nil {
 		return nil, err
 	}
-	affinity, err := chatGPTAffinityKey(req.PromptCacheKey, payload)
+	affinity := strings.TrimSpace(req.PromptCacheKey)
+	if affinity == "" || !p.legacy {
+		affinity, err = chatGPTAffinityKey(req.PromptCacheKey, payload)
+	}
 	if err != nil {
 		return nil, err
 	}
 	payload["prompt_cache_key"] = affinity
+	if p.legacy {
+		metadata := codexTurnMetadata(req, affinity)
+		existing, _ := payload["client_metadata"].(map[string]any)
+		if existing == nil {
+			existing = map[string]any{}
+		}
+		existing[chatGPTTurnMetadataHeader] = metadata
+		payload["client_metadata"] = existing
+	}
 	body, err = json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encode ChatGPT Responses request: %w", err)
@@ -87,7 +104,21 @@ func (p *chatgptProvider) StreamChat(ctx context.Context, req ChatRequest) (Chat
 			p.warnAffinityUnhonored(affinity, echoedPromptCacheKey)
 		},
 	}
-	stream, err := streamResponses(ctx, p.inner.httpClient, p.inner.apiURL, token, body, chatGPTRequestHeaders(req, affinity, turnState), chatGPTResponsesOutputKey, observer)
+	headers := chatGPTRequestHeaders(req, affinity, turnState)
+	if p.legacy {
+		addCodexHeaders(headers, token)
+		if req.CodexAccountID != "" {
+			headers["chatgpt-account-id"] = req.CodexAccountID
+		}
+		if req.CodexDataResidency != "" {
+			headers["x-openai-internal-codex-residency"] = req.CodexDataResidency
+		}
+		headers[chatGPTTurnMetadataHeader] = codexTurnMetadata(req, affinity)
+		if headers[chatGPTWindowIDHeader] == "" {
+			headers[chatGPTWindowIDHeader] = affinity
+		}
+	}
+	stream, err := streamResponses(ctx, p.inner.httpClient, p.inner.apiURL, token, body, headers, chatGPTResponsesOutputKey, observer)
 	if err != nil {
 		return nil, err
 	}

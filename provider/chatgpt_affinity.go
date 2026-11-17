@@ -136,7 +136,9 @@ func (c *chatGPTTurnCache) put(turnID, token, state string) {
 	if c.turnID != turnID || c.tokenDigest != tokenDigest(token) {
 		return
 	}
-	c.state = state
+	if c.state == "" {
+		c.state = state
+	}
 }
 
 // chatGPTRequestTrace collects what one request sent and what the response
