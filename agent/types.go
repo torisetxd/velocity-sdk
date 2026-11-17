@@ -15,6 +15,7 @@ const (
 	EventKindInternal            = vcontext.EventKindInternal
 	EventKindAssistant           = vcontext.EventKindAssistant
 	EventKindTool                = vcontext.EventKindTool
+	EventKindConfiguration       = vcontext.EventKindConfiguration
 	EventKindCompressionBoundary = vcontext.EventKindCompressionBoundary
 )
 
@@ -117,6 +118,7 @@ type Runner struct {
 	Tools                ToolExecutor
 	Model                ModelRef
 	ModelExtra           map[string]any
+	ModelExtraFn         func() map[string]any
 	Root                 string
 	FileReader           FileReader
 	Observer             Observer

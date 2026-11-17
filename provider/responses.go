@@ -100,7 +100,8 @@ type inputItem struct {
 }
 
 func BuildResponsesBody(req ChatRequest, opts OpenAIRequestOptions) ([]byte, error) {
-	input := convertMessagesToResponseInput(req.Messages, opts.ResponsesOutputMetaKey)
+	messages, mergedExtra := effortConfiguration(req.Messages, req.Model, "responses", MergeMaps(opts.ProviderExtraBody, opts.RequestExtraBody), opts.ProviderExtraBody)
+	input := convertMessagesToResponseInput(messages, opts.ResponsesOutputMetaKey)
 	tools := convertToolsToResponsesFormat(req.Tools)
 
 	payload := responsesRequest{
@@ -117,7 +118,6 @@ func BuildResponsesBody(req ChatRequest, opts OpenAIRequestOptions) ([]byte, err
 		return nil, err
 	}
 
-	mergedExtra := MergeMaps(opts.ProviderExtraBody, opts.RequestExtraBody)
 	if req.PromptCacheKey != "" {
 		if mergedExtra == nil {
 			mergedExtra = map[string]any{}
@@ -166,6 +166,10 @@ func convertMessagesToResponseInput(messages []ChatMessage, outputMetaKey string
 		}
 
 		switch role {
+		case "configuration":
+			if msg.Configuration != nil {
+				items = append(items, map[string]any{"type": "configuration_update", "reasoning": msg.Configuration.ExtraBody["reasoning"]})
+			}
 		case "system", "developer":
 			items = append(items, inputItem{
 				Type:    "message",

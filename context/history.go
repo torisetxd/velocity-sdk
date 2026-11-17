@@ -74,6 +74,9 @@ func RenderHistory(events []Event, caps provider.Capabilities) ([]provider.ChatM
 		}
 
 		switch ev.Kind {
+		case EventKindConfiguration:
+			msg.Role = "configuration"
+			msg.Configuration = provider.CloneRequestConfiguration(ev.Configuration)
 		case EventKindSystem:
 			msg.Role = "system"
 		case EventKindUser:

@@ -91,7 +91,7 @@ func (r Runner) run(ctx context.Context, sess Session) (result TurnResult, runEr
 
 	caps := vcontext.ProviderCapabilities(r.Provider)
 	history := CloneEvents(sess.History)
-	renderedHistory, warnings := vcontext.RenderHistory(history, caps)
+	renderedHistory, warnings := vcontext.RenderHistory(vcontext.ConfigurationHistory(history, r.Model), caps)
 	trace := []string{}
 	allReasoning := ""
 	var allReasoningDetails []map[string]any
@@ -124,6 +124,14 @@ func (r Runner) run(ctx context.Context, sess Session) (result TurnResult, runEr
 		var definitions []provider.ToolDef
 		if !forceFinal && r.Tools != nil {
 			definitions = r.Tools.Definitions(ctx)
+		}
+		if r.ModelExtraFn != nil {
+			r.ModelExtra = provider.CopyMapAny(r.ModelExtraFn())
+		}
+		previousLength := len(history)
+		history = vcontext.RecordRequestConfiguration(history, r.Model, r.ModelExtra, definitions)
+		if len(history) != previousLength {
+			renderedHistory, _ = vcontext.RenderHistory(vcontext.ConfigurationHistory(history, r.Model), caps)
 		}
 		r.maybeAutoCompress(ctx, sess.ID, definitions, &history, &renderedHistory, &warnings, &lastReportedTotalTokens, &lastTotalTokens)
 
@@ -441,10 +449,9 @@ func (r Runner) run(ctx context.Context, sess Session) (result TurnResult, runEr
 		toolRounds++
 		if r.MaxToolRounds > 0 && toolRounds >= r.MaxToolRounds {
 			forceFinal = true
-			renderedHistory = append(renderedHistory, provider.ChatMessage{
-				Role:    "system",
-				Content: "You have reached the tool-call safety limit for this response. Do not call more tools. Summarize the completed work, remaining work, and relevant files for the user.",
-			})
+			ev := InternalEvent("You have reached the tool-call safety limit for this response. Do not call more tools. Summarize the completed work, remaining work, and relevant files for the user.")
+			history = append(history, ev)
+			renderedHistory = append(renderedHistory, vcontext.EventToProviderMessage(ev, caps))
 		}
 	}
 }
@@ -495,7 +502,7 @@ func (r Runner) maybeAutoCompress(ctx context.Context, sessionID string, tools [
 	}
 	*history = next
 	caps := vcontext.ProviderCapabilities(r.Provider)
-	rendered, w := vcontext.RenderHistory(*history, caps)
+	rendered, w := vcontext.RenderHistory(vcontext.ConfigurationHistory(*history, r.Model), caps)
 	*renderedHistory = rendered
 	if warnings != nil && len(w) > 0 {
 		*warnings = append(*warnings, w...)

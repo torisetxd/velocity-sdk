@@ -16,6 +16,7 @@ const (
 	EventKindInternal            EventKind = "internal"
 	EventKindAssistant           EventKind = "assistant"
 	EventKindTool                EventKind = "tool"
+	EventKindConfiguration       EventKind = "configuration"
 	EventKindCompressionBoundary EventKind = "compression_boundary"
 )
 
@@ -70,19 +71,20 @@ func (t Timing) Thinking() time.Duration {
 }
 
 type Event struct {
-	Kind             EventKind        `json:"kind"`
-	OccurredAt       string           `json:"occurred_at,omitempty"`
-	Model            *ModelRef        `json:"model,omitempty"`
-	Content          any              `json:"content,omitempty"`
-	ToolCalls        []ToolCall       `json:"tool_calls,omitempty"`
-	ToolCallID       string           `json:"tool_call_id,omitempty"`
-	Reasoning        string           `json:"reasoning,omitempty"`
-	ReasoningDetails []map[string]any `json:"reasoning_details,omitempty"`
-	ProviderMeta     map[string]any   `json:"provider_meta,omitempty"`
-	TotalTokens      int              `json:"total_tokens,omitempty"`
-	CompressionData  *CompressionData `json:"compression,omitempty"`
-	Goal             *GoalState       `json:"goal,omitempty"`
-	Timing           *Timing          `json:"timing,omitempty"`
+	Kind             EventKind                      `json:"kind"`
+	OccurredAt       string                         `json:"occurred_at,omitempty"`
+	Model            *ModelRef                      `json:"model,omitempty"`
+	Content          any                            `json:"content,omitempty"`
+	ToolCalls        []ToolCall                     `json:"tool_calls,omitempty"`
+	ToolCallID       string                         `json:"tool_call_id,omitempty"`
+	Reasoning        string                         `json:"reasoning,omitempty"`
+	ReasoningDetails []map[string]any               `json:"reasoning_details,omitempty"`
+	ProviderMeta     map[string]any                 `json:"provider_meta,omitempty"`
+	TotalTokens      int                            `json:"total_tokens,omitempty"`
+	Configuration    *provider.RequestConfiguration `json:"configuration,omitempty"`
+	CompressionData  *CompressionData               `json:"compression,omitempty"`
+	Goal             *GoalState                     `json:"goal,omitempty"`
+	Timing           *Timing                        `json:"timing,omitempty"`
 }
 
 type RetainedFile struct {
@@ -263,6 +265,7 @@ func CloneEvents(events []Event) []Event {
 			ReasoningDetails: provider.CopyReasoningDetails(ev.ReasoningDetails),
 			ProviderMeta:     provider.CopyMapAny(ev.ProviderMeta),
 			TotalTokens:      ev.TotalTokens,
+			Configuration:    provider.CloneRequestConfiguration(ev.Configuration),
 			CompressionData:  CloneCompressionData(ev.CompressionData),
 			Goal:             CloneGoal(ev.Goal),
 		}

@@ -181,6 +181,14 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (Ch
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	if messages, ok := payload["messages"].([]map[string]any); ok {
+		for _, message := range messages {
+			if message["output_config"] != nil {
+				httpReq.Header.Set("anthropic-beta", "mid-conversation-output-config-2026-07-01")
+				break
+			}
+		}
+	}
 	if err := p.setHeaders(ctx, httpReq); err != nil {
 		cancel()
 		return nil, err
@@ -243,6 +251,7 @@ func classifyAnthropicHTTPError(resp *http.Response, requestBody, rawBody []byte
 // bodies are deep-merged over it, so max_tokens, thinking, output_config and
 // the like are set from there.
 func BuildAnthropicBody(req ChatRequest, providerExtra map[string]any) (map[string]any, error) {
+	prepared, extra := effortConfiguration(req.Messages, req.Model, "anthropic", MergeMaps(providerExtra, req.ExtraBody), providerExtra)
 	var system []map[string]any
 	var messages []map[string]any
 	explicitCache := false
@@ -259,8 +268,10 @@ func BuildAnthropicBody(req ChatRequest, providerExtra map[string]any) (map[stri
 		messages = append(messages, map[string]any{"role": role, "content": blocks})
 	}
 
-	for _, msg := range req.Messages {
+	for _, msg := range prepared {
 		switch msg.Role {
+		case "configuration":
+			messages = append(messages, map[string]any{"role": "system", "content": []any{}, "output_config": msg.Configuration.ExtraBody["output_config"]})
 		case "system", "developer":
 			for _, b := range anthropicContent(msg.Content, &explicitCache) {
 				if b["type"] == "text" {
@@ -332,7 +343,7 @@ func BuildAnthropicBody(req ChatRequest, providerExtra map[string]any) (map[stri
 		body["cache_control"] = map[string]any{"type": "ephemeral"}
 	}
 
-	body = MergeMaps(body, MergeMaps(providerExtra, req.ExtraBody))
+	body = MergeMaps(body, extra)
 	body["model"] = req.Model
 	body["messages"] = messages
 	body["stream"] = true

@@ -11,13 +11,14 @@ import (
 type TokenSource func(ctx context.Context) (string, error)
 
 type ChatMessage struct {
-	Role          string         `json:"role"`
-	Content       any            `json:"content,omitempty"`
-	ToolCalls     []ToolCall     `json:"tool_calls,omitempty"`
-	ToolCallID    string         `json:"tool_call_id,omitempty"`
-	ReasoningMeta map[string]any `json:"reasoning_meta,omitempty"`
-	ProviderMeta  map[string]any `json:"provider_meta,omitempty"`
-	Reasoning     string         `json:"reasoning,omitempty"`
+	Configuration *RequestConfiguration `json:"-"`
+	Role          string                `json:"role"`
+	Content       any                   `json:"content,omitempty"`
+	ToolCalls     []ToolCall            `json:"tool_calls,omitempty"`
+	ToolCallID    string                `json:"tool_call_id,omitempty"`
+	ReasoningMeta map[string]any        `json:"reasoning_meta,omitempty"`
+	ProviderMeta  map[string]any        `json:"provider_meta,omitempty"`
+	Reasoning     string                `json:"reasoning,omitempty"`
 }
 
 type ToolCall struct {
@@ -143,7 +144,7 @@ func ConvertMessagesWithOptions(messages []ChatMessage, opts ConvertMessageOptio
 
 	for _, msg := range messages {
 		role := strings.TrimSpace(msg.Role)
-		if role == "" {
+		if role == "" || role == "configuration" {
 			continue
 		}
 

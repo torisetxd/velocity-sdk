@@ -37,6 +37,7 @@ type CompressionRequestOptions struct {
 	Root             string
 	FileReader       FileReader
 	SummaryTransform func(events []Event, summary string) string
+	PrepareMessages  func([]provider.ChatMessage) []provider.ChatMessage
 }
 
 func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRef, modelExtra map[string]any, history []Event, opts CompressionRequestOptions) (CompressionResult, error) {
@@ -52,7 +53,18 @@ func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRe
 		return CompressionResult{}, fmt.Errorf("no conversation to compress")
 	}
 
-	renderedHistory, _ := RenderHistory(events, ProviderCapabilities(p))
+	if config := LastRequestConfiguration(events, model); config != nil {
+		opts.Tools = config.Tools
+	}
+	events = RecordRequestConfiguration(events, model, modelExtra, opts.Tools)
+	renderedHistory, _ := RenderHistory(ConfigurationHistory(events, model), ProviderCapabilities(p))
+	if opts.PrepareMessages != nil {
+		renderedHistory = opts.PrepareMessages(renderedHistory)
+	}
+	choice := ""
+	if len(opts.Tools) > 0 {
+		choice = "auto"
+	}
 	req := provider.ChatRequest{
 		Model: model.Model,
 		Messages: append(renderedHistory, provider.ChatMessage{
@@ -60,7 +72,7 @@ func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRe
 			Content: compressionUserRequest(opts.FileReader != nil),
 		}),
 		Tools:          append([]provider.ToolDef(nil), opts.Tools...),
-		ToolChoice:     "none",
+		ToolChoice:     choice,
 		Stream:         true,
 		ExtraBody:      provider.CopyMapAny(modelExtra),
 		PromptCacheKey: strings.TrimSpace(opts.PromptCacheKey),
@@ -86,6 +98,9 @@ func CompressConversation(ctx stdctx.Context, p provider.Provider, model ModelRe
 				break
 			}
 			return CompressionResult{}, recvErr
+		}
+		if len(ev.ToolCallDeltas) > 0 {
+			return CompressionResult{}, fmt.Errorf("compression model returned a tool call instead of a summary")
 		}
 		if ev.Content != "" {
 			summary.WriteString(ev.Content)
@@ -337,7 +352,7 @@ func collapseImageDataURLs(s string) int {
 func NonSystemEvents(events []Event) []Event {
 	out := make([]Event, 0, len(events))
 	for _, ev := range events {
-		if ev.Kind != EventKindSystem && ev.Kind != EventKindInternal && ev.Kind != EventKindCompressionBoundary {
+		if ev.Kind != EventKindSystem && ev.Kind != EventKindInternal && ev.Kind != EventKindConfiguration && ev.Kind != EventKindCompressionBoundary {
 			out = append(out, ev)
 		}
 	}
@@ -365,6 +380,7 @@ func ActiveHistory(events []Event) []Event {
 		case i < boundary && ev.Kind != EventKindSystem:
 			continue
 		case i == boundary:
+			out = append(out, configurationSnapshot(events[:boundary])...)
 			block := BoundaryAsBlock(ev)
 			if block != "" {
 				out = append(out, InternalEvent(block))
