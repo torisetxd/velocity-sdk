@@ -24,7 +24,7 @@ func enableCodexReasoningPersistence(body []byte) (map[string]any, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
-	for _, key := range []string{"max_output_tokens", "temperature", "top_p", "previous_response_id", "prompt_cache_retention"} {
+	for _, key := range []string{"max_output_tokens", "temperature", "top_p", "previous_response_id", "prompt_cache_retention", "truncation"} {
 		delete(payload, key)
 	}
 	payload["store"], payload["stream"] = false, true
