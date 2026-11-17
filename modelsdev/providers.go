@@ -12,6 +12,7 @@ import (
 var providerByType = map[string]string{
 	inference.TypeResponses:        "openai",
 	inference.TypeChatGPT:          "openai",
+	inference.TypeCodex:            "openai",
 	inference.TypeCopilot:          "github-copilot",
 	inference.TypeCopilotResponses: "github-copilot",
 	inference.TypeAnthropic:        "anthropic",
