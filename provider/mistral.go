@@ -21,8 +21,8 @@ type mistralProvider struct {
 }
 
 // NewMistralProvider builds the La Plateforme provider. An empty apiURL
-// defaults to DefaultMistralChatURL; an empty reasoningField keeps the
-// "reasoning_content" default the OpenAI-compatible layer already uses.
+// defaults to DefaultMistralChatURL. reasoningField is an optional read alias
+// for compatible endpoints; native Mistral uses typed thinking content parts.
 func NewMistralProvider(apiURL, apiKey string, extraBody map[string]any, reasoningField string) Provider {
 	if apiURL == "" {
 		apiURL = DefaultMistralChatURL
@@ -31,7 +31,28 @@ func NewMistralProvider(apiURL, apiKey string, extraBody map[string]any, reasoni
 }
 
 func (p *mistralProvider) StreamChat(ctx context.Context, req ChatRequest) (ChatStream, error) {
-	return p.inner.StreamChat(ctx, req)
+	base := p.inner
+	token, err := base.resolveToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	body, err := BuildOpenAIChatBody(req, OpenAIRequestOptions{
+		ForceStream:          true,
+		IncludeUsage:         true,
+		ProviderExtraBody:    base.extraBody,
+		RequestExtraBody:     req.ExtraBody,
+		ReasoningPersistence: ReasoningPersistence{assistantContent: mistralAssistantContent},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var content mistralContentStream
+	return streamChatCompletions(ctx, base.httpClient, base.apiURL, token, body, base.extraHeaders, streamOpts{
+		ReasoningFields: ReasoningReadFields(base.reasoningField),
+		DecodeContent:   content.decode,
+		FinalEvent:      content.finalEvent,
+	})
 }
 
 func (p *mistralProvider) FetchModels(ctx context.Context) ([]ModelInfo, error) {

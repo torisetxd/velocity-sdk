@@ -158,10 +158,11 @@ func ConvertMessagesWithOptions(messages []ChatMessage, opts ConvertMessageOptio
 			}
 		}
 
-		chatMsg := map[string]any{
-			"role":    role,
-			"content": normalizeContentForRole(msg.Content, role),
+		content := normalizeContentForRole(msg.Content, role)
+		if role == "assistant" && reasoning.assistantContent != nil {
+			content = reasoning.assistantContent(msg, content)
 		}
+		chatMsg := map[string]any{"role": role, "content": content}
 
 		if len(msg.ToolCalls) > 0 {
 			chatMsg["tool_calls"] = msg.ToolCalls
@@ -195,8 +196,8 @@ func ConvertMessagesWithOptions(messages []ChatMessage, opts ConvertMessageOptio
 }
 
 func (opts ConvertMessageOptions) reasoningPersistence() ReasoningPersistence {
-	if len(opts.ReasoningPersistence.TextFields) > 0 || strings.TrimSpace(opts.ReasoningPersistence.DetailsField) != "" {
-		return normalizeReasoningPersistence(opts.ReasoningPersistence)
+	if p := opts.ReasoningPersistence; len(p.TextFields) > 0 || strings.TrimSpace(p.DetailsField) != "" || p.assistantContent != nil {
+		return normalizeReasoningPersistence(p)
 	}
 
 	p := ReasoningPersistence{}

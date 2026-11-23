@@ -21,6 +21,7 @@ import (
 type streamOpts struct {
 	ReasoningField  string
 	ReasoningFields []string
+	DecodeContent   func(json.RawMessage, *StreamEvent)
 	ProcessDelta    func(raw map[string]json.RawMessage, ev *StreamEvent)
 	FinalEvent      func() (StreamEvent, bool)
 }
@@ -472,10 +473,6 @@ func (s *openAIStream) parseEvent(payload string) (*StreamEvent, error) {
 	if roleBytes, ok := delta["role"]; ok {
 		_ = json.Unmarshal(roleBytes, &ev.Role)
 	}
-	if contentBytes, ok := delta["content"]; ok {
-		ev.Content = parseContentValue(contentBytes)
-	}
-
 	for _, field := range s.reasoningFields() {
 		if reasoningBytes, ok := delta[field]; ok {
 			ev.Reasoning = parseReasoning(reasoningBytes)
@@ -483,6 +480,12 @@ func (s *openAIStream) parseEvent(payload string) (*StreamEvent, error) {
 				break
 			}
 		}
+	}
+
+	if s.opts.DecodeContent != nil {
+		s.opts.DecodeContent(delta["content"], &ev)
+	} else {
+		ev.Content = parseContentValue(delta["content"])
 	}
 
 	if detailsBytes, ok := delta["reasoning_details"]; ok {
