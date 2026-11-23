@@ -22,6 +22,7 @@ var providerByType = map[string]string{
 	inference.TypeGemini:           "google",
 	inference.TypeVertex:           "google-vertex",
 	inference.TypeKimi:             "moonshotai",
+	inference.TypeMistral:          "mistral",
 	inference.TypeZen:              "opencode",
 }
 

@@ -21,6 +21,7 @@ const (
 	TypeZen              = "zen"
 	TypeCline            = "cline"
 	TypeKimi             = "kimi"
+	TypeMistral          = "mistral"
 	TypeQwenTokenPlan    = "qwen-token-plan"
 	TypeGemini           = "gemini"
 	TypeVertex           = "vertex"
@@ -35,6 +36,7 @@ const (
 	DefaultZenURL              = "https://opencode.ai/zen/v1/chat/completions"
 	DefaultClineURL            = "https://api.cline.bot/api/v1/chat/completions"
 	DefaultKimiURL             = "https://api.kimi.com/coding/v1/chat/completions"
+	DefaultMistralURL          = provider.DefaultMistralChatURL
 	DefaultQwenTokenPlanURL    = provider.DefaultQwenTokenPlanURL
 	DefaultGeminiURL           = "https://generativelanguage.googleapis.com/v1beta"
 	DefaultAnthropicURL        = provider.DefaultAnthropicURL
@@ -84,6 +86,8 @@ func DetectType(rawType, apiURL string) string {
 		return TypeCline
 	case strings.Contains(lowerURL, "api.kimi.com/coding"), strings.Contains(lowerURL, "api.kimi.ai/coding"):
 		return TypeKimi
+	case strings.Contains(lowerURL, "api.mistral.ai"):
+		return TypeMistral
 	case strings.Contains(lowerURL, "qwencloudapi.com"), strings.Contains(lowerURL, "qwencloud.com"):
 		return TypeQwenTokenPlan
 	case strings.Contains(lowerURL, "generativelanguage.googleapis.com"):
@@ -117,6 +121,8 @@ func DefaultURLForType(providerType string) string {
 		return DefaultClineURL
 	case TypeKimi:
 		return DefaultKimiURL
+	case TypeMistral:
+		return DefaultMistralURL
 	case TypeQwenTokenPlan:
 		return DefaultQwenTokenPlanURL
 	case TypeGemini:
@@ -204,6 +210,9 @@ func registerBuiltins(registry *Registry) {
 		}
 		return provider.NewKimiProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField), nil
 	}, "kimi-code")
+	mustRegister(registry, TypeMistral, func(config Config) (Client, error) {
+		return provider.NewMistralProvider(config.APIURL, config.APIKey, config.ExtraBody, config.ReasoningField), nil
+	}, "mistral-vibe", "mistral-code")
 	mustRegister(registry, TypeQwenTokenPlan, func(config Config) (Client, error) {
 		if config.APIURL == "" {
 			config.APIURL = DefaultQwenTokenPlanURL
