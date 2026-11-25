@@ -8,7 +8,7 @@ import (
 const mistralContentMetaKey = "mistral_content"
 
 func mistralAssistantContent(msg ChatMessage, content any) any {
-	if parts := mistralContentParts(msg.ProviderMeta[mistralContentMetaKey]); len(parts) > 0 {
+	if parts := normalizeMistralParts(mistralContentParts(msg.ProviderMeta[mistralContentMetaKey])); len(parts) > 0 {
 		return parts
 	}
 	if strings.TrimSpace(msg.Reasoning) == "" {
@@ -60,11 +60,11 @@ func (s *mistralContentStream) decode(raw json.RawMessage, ev *StreamEvent) {
 			part["thinking"] = append([]map[string]any{mistralTextPart(ev.Reasoning)}, mistralContentParts(part["thinking"])...)
 		}
 	}
-	for i, part := range parts {
+	for _, part := range parts {
 		if part["type"] == "thinking" && (len(mistralContentParts(part["thinking"])) > 0 || part["signature"] != nil) {
 			s.hasThinking = true
 		}
-		s.parts = appendMistralPart(s.parts, part, i == 0)
+		s.parts = appendMistralPart(s.parts, part, true)
 	}
 }
 
@@ -73,7 +73,11 @@ func (s *mistralContentStream) finalEvent() (StreamEvent, bool) {
 	if !s.hasThinking {
 		return StreamEvent{}, false
 	}
-	return StreamEvent{ProviderMeta: map[string]any{mistralContentMetaKey: mistralWireParts(s.parts)}}, true
+	wire := normalizeMistralParts(mistralWireParts(s.parts))
+	if len(wire) == 0 {
+		return StreamEvent{}, false
+	}
+	return StreamEvent{ProviderMeta: map[string]any{mistralContentMetaKey: wire}}, true
 }
 
 type mistralContentPart struct {
@@ -84,26 +88,19 @@ type mistralContentPart struct {
 
 func appendMistralPart(parts []*mistralContentPart, part map[string]any, continuation bool) []*mistralContentPart {
 	kind := part["type"]
+	if kind == "text" {
+		if text, _ := part["text"].(string); text == "" {
+			return parts
+		}
+	}
 	var current *mistralContentPart
 	if continuation && len(parts) > 0 {
 		last := parts[len(parts)-1]
-		if last.fields["type"] == kind {
-			switch kind {
-			case "text":
-				current = last
-			case "thinking":
-				closed, _ := last.fields["closed"].(bool)
-				priorSignature, _ := last.fields["signature"].(string)
-				nextSignature, _ := part["signature"].(string)
-				if (!closed || len(mistralContentParts(part["thinking"])) == 0) &&
-					(priorSignature == "" || nextSignature == "" || priorSignature == nextSignature) {
-					current = last
-				}
-			}
+		if last.fields["type"] == kind && (kind == "text" || kind == "thinking") {
+			current = last
 		}
 	}
-	merging := current != nil
-	if !merging {
+	if current == nil {
 		current = &mistralContentPart{fields: part}
 		parts = append(parts, current)
 	}
@@ -112,8 +109,8 @@ func appendMistralPart(parts []*mistralContentPart, part map[string]any, continu
 		text, _ := part["text"].(string)
 		current.text.WriteString(text)
 	case "thinking":
-		for i, inner := range mistralContentParts(part["thinking"]) {
-			current.thinking = appendMistralPart(current.thinking, inner, merging && i == 0)
+		for _, inner := range mistralContentParts(part["thinking"]) {
+			current.thinking = appendMistralPart(current.thinking, inner, true)
 		}
 		for _, key := range []string{"signature", "closed"} {
 			if value := part[key]; value != nil {
@@ -124,18 +121,40 @@ func appendMistralPart(parts []*mistralContentPart, part map[string]any, continu
 	return parts
 }
 
+func normalizeMistralParts(parts []map[string]any) []map[string]any {
+	if len(parts) == 0 {
+		return nil
+	}
+	var thinking []*mistralContentPart
+	var other []*mistralContentPart
+	for _, part := range parts {
+		cloned := CopyMapAny(part)
+		if cloned["type"] == "thinking" {
+			thinking = appendMistralPart(thinking, cloned, true)
+		} else {
+			other = appendMistralPart(other, cloned, true)
+		}
+	}
+	return mistralWireParts(append(thinking, other...))
+}
+
 func mistralWireParts(parts []*mistralContentPart) []map[string]any {
 	wire := make([]map[string]any, 0, len(parts))
 	for _, part := range parts {
 		fields := CopyMapAny(part.fields)
 		switch fields["type"] {
 		case "text":
-			fields["text"] = part.text.String()
-		case "thinking":
-			if len(part.thinking) == 0 && fields["signature"] == nil {
+			text := part.text.String()
+			if text == "" {
 				continue
 			}
-			fields["thinking"] = mistralWireParts(part.thinking)
+			fields["text"] = text
+		case "thinking":
+			inner := mistralWireParts(part.thinking)
+			if len(inner) == 0 && fields["signature"] == nil {
+				continue
+			}
+			fields["thinking"] = inner
 		}
 		wire = append(wire, fields)
 	}
